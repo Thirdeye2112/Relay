@@ -583,15 +583,18 @@ elif mode == "Agents":
                             if st.button("Unassign", key=f"ua_{name}", use_container_width=True):
                                 mgr.unassign(name); st.rerun()
                         else:
-                            # Two options: find an already-open tab, or open a new one
+                            site = site_for_agent(name)
+                            is_claude = site and site.get("key") == "claude"
                             bc1, bc2 = st.columns(2)
                             with bc1:
                                 if st.button("Find Tab", key=f"ft_{name}", use_container_width=True,
-                                             help="Assign an already-open tab for this agent"):
+                                             help="Assign an already-open tab for this agent",
+                                             type="primary" if is_claude else "secondary"):
                                     auto_assign_tabs(mgr); st.rerun()
                             with bc2:
                                 if st.button("Open Tab", key=f"ot_{name}", use_container_width=True,
-                                             help="Open a new tab in Chrome for this agent"):
+                                             help="Open a new tab in Chrome for this agent",
+                                             type="secondary"):
                                     with st.spinner(f"Opening {name.upper()}…"):
                                         try:
                                             mgr.open_tab(name); st.rerun()
@@ -600,6 +603,8 @@ elif mode == "Agents":
                             err = st.session_state.pop(f"tab_err_{name}", None)
                             if err:
                                 st.error(err)
+                            if is_claude and not has_tab:
+                                st.caption("💡 For Claude: open claude.ai manually in Chrome, sign in, then click **Find Tab**")
                     elif is_browser and not mgr:
                         st.caption("Connect Chrome first")
 

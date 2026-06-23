@@ -228,6 +228,15 @@ class BrowserManager:
             with sync_playwright() as pw:
                 try:
                     self._browser = pw.chromium.connect_over_cdp(CDP_URL)
+                    # Hide webdriver flag and arm auto-resume on every page globally
+                    for ctx in self._browser.contexts:
+                        try:
+                            ctx.add_init_script(
+                                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
+                            )
+                            ctx.on("page", self._arm_auto_resume)
+                        except Exception:
+                            pass
                     self._ready_q.put(("ok", None))
                 except Exception as e:
                     self._ready_q.put(("error", str(e)))
@@ -308,12 +317,16 @@ class BrowserManager:
             ctx = self._browser.contexts[0]
             page = ctx.new_page()
             self._arm_auto_resume(page)
-            self._pages[agent] = page
-            # "commit" returns as soon as the server responds — before any JS runs.
-            # The page keeps loading in the background, freeing the queue immediately.
+            # "commit" returns as soon as the server responds — before JS runs.
+            # Assign after goto so a failed navigation doesn't leave a broken entry.
             page.goto(site["url"], wait_until="commit", timeout=15_000)
+            self._pages[agent] = page
             res_q.put(("ok", None))
         except Exception as e:
+            try:
+                page.close()
+            except Exception:
+                pass
             res_q.put(("error", str(e)))
 
     def _do_send(self, agent: str, payload, res_q):
