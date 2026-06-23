@@ -1,0 +1,25 @@
+# Secrets — never commit these
+keys.json
+*token*.txt
+*key*.txt
+*secret*.txt
+*password*.txt
+*pw*.txt
+.env
+*.env
+
+# Local data
+sessions/
+browser_profiles/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+venv/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
