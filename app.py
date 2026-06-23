@@ -12,10 +12,19 @@ from relay import (
     append_message, Message, SESSIONS_DIR, AGENTS_FILE, AgentConfig,
 )
 try:
-    from browser_relay import BrowserManager, site_for_agent, SITES
+    import importlib, importlib.util as _ilu
+    _br_path = Path(__file__).parent / "browser_relay.py"
+    _br_spec = _ilu.spec_from_file_location("browser_relay", _br_path)
+    _br_mod  = _ilu.module_from_spec(_br_spec)
+    _br_spec.loader.exec_module(_br_mod)
+    BrowserManager  = _br_mod.BrowserManager
+    site_for_agent  = _br_mod.site_for_agent
+    SITES           = _br_mod.SITES
     PLAYWRIGHT_AVAILABLE = True
-except Exception:
+    PLAYWRIGHT_ERROR = None
+except Exception as _pw_err:
     PLAYWRIGHT_AVAILABLE = False
+    PLAYWRIGHT_ERROR = str(_pw_err)
     def site_for_agent(name): return None  # noqa: E704
     SITES = {}
 
@@ -524,7 +533,7 @@ elif mode == "Agents":
                             if err:
                                 st.error(err)
                     elif is_browser and not PLAYWRIGHT_AVAILABLE:
-                        st.caption("playwright not installed")
+                        st.error(f"Import failed: {PLAYWRIGHT_ERROR}")
 
                 with c3:
                     if st.button("Edit", key=f"e_{name}"):
