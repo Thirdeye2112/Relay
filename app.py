@@ -14,8 +14,10 @@ from relay import (
 try:
     from browser_relay import BrowserManager, site_for_agent, SITES
     PLAYWRIGHT_AVAILABLE = True
-except ImportError:
+except Exception:
     PLAYWRIGHT_AVAILABLE = False
+    def site_for_agent(name): return None  # noqa: E704
+    SITES = {}
 
 try:
     from github_relay import (
