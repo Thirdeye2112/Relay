@@ -123,12 +123,9 @@ def _type_and_submit(page, site: dict, message: str) -> None:
         )
     el = loc.last
     el.click()
-    time.sleep(0.1)
-    el.press("Control+a")
-    time.sleep(0.05)
-    el.press("Delete")
-    time.sleep(0.1)
-    el.type(message, delay=15)
+    # fill() is instant regardless of message length — type() with delay
+    # times out on long messages (2000 chars × 15ms = 30s = timeout)
+    el.fill(message)
     time.sleep(0.2)
 
     submitted = False
