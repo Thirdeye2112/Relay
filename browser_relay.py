@@ -1,17 +1,18 @@
 """
 browser_relay.py — Playwright browser automation for Relay.
 
-One shared browser context (one window), one tab per agent.
-All Playwright calls happen on a single dedicated thread.
+One BrowserManager owns a single Playwright instance on one dedicated thread.
+Each agent gets its own persistent profile (separate login) and its own window.
+All Playwright calls are routed through the manager thread — never cross-thread.
 """
 import queue
+import shutil
 import threading
 import time
 from pathlib import Path
 from typing import Optional
 
 PROFILES_DIR = Path(__file__).parent / "browser_profiles"
-SHARED_PROFILE = PROFILES_DIR / "_shared"
 
 SITES: dict[str, dict] = {
     "chatgpt": {
@@ -99,6 +100,19 @@ def site_for_agent(agent_name: str) -> Optional[dict]:
     return None
 
 
+def profile_exists(agent_name: str) -> bool:
+    """True if this agent has a saved browser profile (i.e. has logged in before)."""
+    p = PROFILES_DIR / agent_name
+    return p.exists() and any(p.iterdir())
+
+
+def reset_profile(agent_name: str) -> None:
+    """Delete the agent's saved profile so it gets a fresh login next launch."""
+    p = PROFILES_DIR / agent_name
+    if p.exists():
+        shutil.rmtree(p)
+
+
 # ── Page helpers ───────────────────────────────────────────────────────────────
 
 def _resolve_selector(page, selectors, timeout: int = 8000):
@@ -132,8 +146,8 @@ def _type_and_submit(page, site: dict, message: str) -> None:
     el.type(message, delay=15)
     time.sleep(0.2)
 
-    send_sel = site.get("send_btn")
     submitted = False
+    send_sel = site.get("send_btn")
     if send_sel:
         try:
             btn = page.locator(send_sel)
@@ -199,157 +213,192 @@ def _read_last_response(page, site: dict) -> str:
     return "[No response text found — check the browser window]"
 
 
-# ── BrowserManager — one window, tabs per agent ────────────────────────────────
+# ── BrowserManager ─────────────────────────────────────────────────────────────
 
 class BrowserManager:
     """
-    Single Playwright persistent context (one browser window).
-    Each agent gets its own tab. All Playwright calls stay on one thread.
+    Manages one Playwright instance on a single dedicated thread.
+    Each agent gets its own persistent context (profile) and window,
+    so logins are completely independent per agent.
     """
 
     def __init__(self):
-        self._cmd_q  = queue.Queue()
-        self._thread = threading.Thread(target=self._run, daemon=True,
-                                        name="browser-manager")
-        self._pages: dict[str, object] = {}
+        self._cmd_q    = queue.Queue()
+        self._ready_q  = queue.Queue()
+        self._contexts: dict[str, object] = {}
+        self._pages:    dict[str, object] = {}
+        self._thread   = threading.Thread(
+            target=self._run, daemon=True, name="browser-manager"
+        )
         self._thread.start()
-        # Wait for browser to open
         try:
-            status, val = self._cmd_q.join_result = None, None
-            init_q = queue.Queue()
-            self._init_q = init_q
-            status, val = init_q.get(timeout=60)
+            status, val = self._ready_q.get(timeout=30)
         except queue.Empty:
             raise RuntimeError(
-                "Browser did not open within 60 s. "
+                "Browser manager failed to start. "
                 "Run: python -m playwright install chromium"
             )
         if status == "error":
             raise RuntimeError(val)
 
+    # ── Thread ────────────────────────────────────────────────────────────────
+
     def _run(self):
         try:
             from playwright.sync_api import sync_playwright
-            SHARED_PROFILE.mkdir(parents=True, exist_ok=True)
             with sync_playwright() as pw:
-                ctx = pw.chromium.launch_persistent_context(
-                    str(SHARED_PROFILE),
-                    headless=False,
-                    viewport={"width": 1280, "height": 900},
-                    args=["--disable-blink-features=AutomationControlled"],
-                )
-                # Signal ready
-                self._init_q.put(("ok", None))
+                self._pw = pw
+                self._ready_q.put(("ok", None))
 
                 while True:
                     try:
                         cmd = self._cmd_q.get(timeout=1)
                     except queue.Empty:
-                        # Heartbeat — check context still alive
-                        try:
-                            _ = ctx.pages
-                        except Exception:
-                            return
+                        self._heartbeat()
                         continue
 
                     if cmd is None:
-                        ctx.close()
+                        self._close_all()
                         break
 
                     action, agent, payload, res_q = cmd
                     try:
-                        if action == "open":
-                            site = site_for_agent(agent)
-                            # Reuse existing tab if the agent already has one open
-                            page = self._pages.get(agent)
-                            if page is None or page.is_closed():
-                                page = ctx.new_page()
-                                self._pages[agent] = page
-                            if site and site["url_match"] not in page.url:
-                                page.goto(site["url"], wait_until="domcontentloaded",
-                                          timeout=30_000)
-                            # Bring tab to front
-                            page.bring_to_front()
-                            res_q.put(("ok", None))
-
-                        elif action == "send":
-                            page = self._pages.get(agent)
-                            if page is None or page.is_closed():
-                                raise RuntimeError(f"No open tab for '{agent}'")
-                            site = site_for_agent(agent)
-                            if site is None:
-                                raise RuntimeError(f"Unknown site for agent '{agent}'")
-                            msg, timeout = payload
-                            page.bring_to_front()
-                            _type_and_submit(page, site, msg)
-                            reply = _wait_and_read(page, site, timeout)
-                            res_q.put(("ok", reply))
-
-                        elif action == "close":
-                            page = self._pages.pop(agent, None)
-                            if page and not page.is_closed():
-                                page.close()
-                            res_q.put(("ok", None))
-
-                        elif action == "status":
-                            page = self._pages.get(agent)
-                            if page and not page.is_closed():
-                                res_q.put(("ok", {"url": page.url, "title": page.title()}))
-                            else:
-                                res_q.put(("ok", {}))
-
-                        elif action == "list":
-                            res_q.put(("ok", list(self._pages.keys())))
-
+                        if   action == "open":   self._do_open(agent, res_q)
+                        elif action == "send":   self._do_send(agent, payload, res_q)
+                        elif action == "close":  self._do_close(agent, res_q)
+                        elif action == "status": self._do_status(agent, res_q)
+                        elif action == "list":   res_q.put(("ok", list(self._pages.keys())))
                     except Exception as e:
                         res_q.put(("error", str(e)))
 
         except Exception as e:
             try:
-                self._init_q.put(("error", str(e)))
+                self._ready_q.put(("error", str(e)))
             except Exception:
                 pass
 
-    def _call(self, action: str, agent: str, payload=None, timeout: int = 30):
+    def _heartbeat(self):
+        dead = []
+        for name, ctx in self._contexts.items():
+            try:
+                _ = ctx.pages
+            except Exception:
+                dead.append(name)
+        for name in dead:
+            self._contexts.pop(name, None)
+            self._pages.pop(name, None)
+
+    def _close_all(self):
+        for ctx in list(self._contexts.values()):
+            try:
+                ctx.close()
+            except Exception:
+                pass
+        self._contexts.clear()
+        self._pages.clear()
+
+    def _do_open(self, agent: str, res_q):
+        # Close stale context for this agent if present
+        if agent in self._contexts:
+            try:
+                self._contexts[agent].pages  # probe
+            except Exception:
+                self._contexts.pop(agent, None)
+                self._pages.pop(agent, None)
+
+        if agent not in self._contexts:
+            profile = PROFILES_DIR / agent
+            profile.mkdir(parents=True, exist_ok=True)
+            ctx = self._pw.chromium.launch_persistent_context(
+                str(profile),
+                headless=False,
+                viewport={"width": 1280, "height": 900},
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            self._contexts[agent] = ctx
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            self._pages[agent] = page
+
+            site = site_for_agent(agent)
+            if site and site["url_match"] not in page.url:
+                page.goto(site["url"], wait_until="domcontentloaded", timeout=30_000)
+
+        res_q.put(("ok", None))
+
+    def _do_send(self, agent: str, payload, res_q):
+        page = self._pages.get(agent)
+        if page is None or page.is_closed():
+            raise RuntimeError(f"No open window for '{agent}' — launch it first")
+        site = site_for_agent(agent)
+        if site is None:
+            raise RuntimeError(f"Unknown site for agent '{agent}'")
+        msg, timeout = payload
+        page.bring_to_front()
+        _type_and_submit(page, site, msg)
+        reply = _wait_and_read(page, site, timeout)
+        res_q.put(("ok", reply))
+
+    def _do_close(self, agent: str, res_q):
+        ctx = self._contexts.pop(agent, None)
+        self._pages.pop(agent, None)
+        if ctx:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+        res_q.put(("ok", None))
+
+    def _do_status(self, agent: str, res_q):
+        page = self._pages.get(agent)
+        if page and not page.is_closed():
+            try:
+                res_q.put(("ok", {"url": page.url, "title": page.title()}))
+                return
+            except Exception:
+                pass
+        res_q.put(("ok", {}))
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def _call(self, action: str, agent: str, payload=None, timeout: int = 40):
         res_q = queue.Queue()
         self._cmd_q.put((action, agent, payload, res_q))
         try:
             status, val = res_q.get(timeout=timeout)
         except queue.Empty:
-            raise RuntimeError(f"Browser manager timed out on '{action}' for '{agent}'")
+            raise RuntimeError(f"Timed out on '{action}' for '{agent}'")
         if status == "error":
             raise RuntimeError(val)
         return val
 
     def open(self, agent_name: str) -> None:
-        """Open a new tab for this agent and navigate to its site."""
-        self._call("open", agent_name, timeout=40)
+        self._call("open", agent_name, timeout=45)
 
     def send_message(self, agent_name: str, message: str, timeout: int = 120) -> str:
-        """Send a message in the agent's tab, wait for response."""
         return self._call("send", agent_name, (message, timeout), timeout=timeout + 30)
 
     def close_agent(self, agent_name: str) -> None:
-        """Close this agent's tab."""
         self._call("close", agent_name, timeout=10)
 
     def status(self, agent_name: str) -> dict:
-        """Return current URL + title for the agent's tab."""
         try:
             return self._call("status", agent_name, timeout=5) or {}
         except Exception:
             return {}
 
     def has_agent(self, agent_name: str) -> bool:
-        """True if this agent has an open, non-closed tab."""
         try:
-            s = self.status(agent_name)
-            return bool(s)
+            return bool(self.status(agent_name))
         except Exception:
             return False
 
+    def active_agents(self) -> list:
+        try:
+            return self._call("list", "", timeout=5)
+        except Exception:
+            return []
+
     def close(self) -> None:
-        """Shut down the entire browser."""
         self._cmd_q.put(None)
         self._thread.join(timeout=10)
 

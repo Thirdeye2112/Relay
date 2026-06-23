@@ -543,6 +543,17 @@ elif mode == "Agents":
                         close_worker(name)
                         del agents_cfg[name]; save_agents(agents_cfg); st.rerun()
 
+            # Reset login button (only for browser agents with a saved profile)
+            if is_browser and PLAYWRIGHT_AVAILABLE:
+                from browser_relay import profile_exists, reset_profile
+                if profile_exists(name):
+                    if st.button(f"↺ Reset login for {name.upper()}",
+                                 key=f"reset_{name}", use_container_width=True):
+                        close_worker(name)
+                        reset_profile(name)
+                        st.success(f"Login cleared — next Launch will ask you to sign in.")
+                        st.rerun()
+
         if not PLAYWRIGHT_AVAILABLE:
             st.info("Install Playwright for browser agents:\n```\npip install playwright\nplaywright install chromium\n```")
 
