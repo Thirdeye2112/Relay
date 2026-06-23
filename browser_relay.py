@@ -5,8 +5,10 @@ One BrowserManager owns a single Playwright instance on one dedicated thread.
 Each agent gets its own persistent profile (separate login) and its own window.
 All Playwright calls are routed through the manager thread — never cross-thread.
 """
+import os
 import queue
 import shutil
+import stat
 import threading
 import time
 from pathlib import Path
@@ -109,8 +111,23 @@ def profile_exists(agent_name: str) -> bool:
 def reset_profile(agent_name: str) -> None:
     """Delete the agent's saved profile so it gets a fresh login next launch."""
     p = PROFILES_DIR / agent_name
-    if p.exists():
-        shutil.rmtree(p)
+    if not p.exists():
+        return
+    # Windows holds file locks briefly after Chrome closes — retry a few times
+    def _force_remove(func, path, _):
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        except Exception:
+            pass
+    for attempt in range(5):
+        try:
+            shutil.rmtree(p, onerror=_force_remove)
+            return
+        except PermissionError:
+            time.sleep(1)
+    # Last attempt — remove what we can, leave locked files
+    shutil.rmtree(p, ignore_errors=True)
 
 
 # ── Page helpers ───────────────────────────────────────────────────────────────
