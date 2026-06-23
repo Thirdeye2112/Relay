@@ -197,6 +197,21 @@ def auto_assign_tabs(m: "BrowserManager") -> None:
                     pass
                 break
 
+def find_tab_for_agent(m: "BrowserManager", agent_name: str) -> str | None:
+    """Find an open tab matching this agent and assign it. Returns tab URL or None."""
+    tabs = m.scan_tabs()
+    site = site_for_agent(agent_name)
+    if not site:
+        return None
+    for i, tab in enumerate(tabs):
+        if site["url_match"] in tab["url"]:
+            try:
+                m.assign_tab(agent_name, i)
+                return tab["url"]
+            except Exception:
+                continue
+    return None
+
 def disconnect_browser() -> None:
     m = st.session_state.pop("browser_manager", None)
     if m:
@@ -588,13 +603,16 @@ elif mode == "Agents":
                             bc1, bc2 = st.columns(2)
                             with bc1:
                                 if st.button("Find Tab", key=f"ft_{name}", use_container_width=True,
-                                             help="Assign an already-open tab for this agent",
                                              type="primary" if is_claude else "secondary"):
-                                    auto_assign_tabs(mgr); st.rerun()
+                                    found = find_tab_for_agent(mgr, name)
+                                    if found:
+                                        st.rerun()
+                                    else:
+                                        site_key = (site_for_agent(name) or {}).get("url_match", "the site")
+                                        st.session_state[f"tab_err_{name}"] = f"No open {site_key} tab found — open it in Chrome first, then click Find Tab"
+                                        st.rerun()
                             with bc2:
-                                if st.button("Open Tab", key=f"ot_{name}", use_container_width=True,
-                                             help="Open a new tab in Chrome for this agent",
-                                             type="secondary"):
+                                if st.button("Open Tab", key=f"ot_{name}", use_container_width=True):
                                     with st.spinner(f"Opening {name.upper()}…"):
                                         try:
                                             mgr.open_tab(name); st.rerun()
@@ -604,7 +622,7 @@ elif mode == "Agents":
                             if err:
                                 st.error(err)
                             if is_claude and not has_tab:
-                                st.caption("💡 For Claude: open claude.ai manually in Chrome, sign in, then click **Find Tab**")
+                                st.caption("💡 Open claude.ai in Chrome, sign in, then **Find Tab**")
                     elif is_browser and not mgr:
                         st.caption("Connect Chrome first")
 
