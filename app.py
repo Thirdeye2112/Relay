@@ -543,12 +543,12 @@ elif mode == "Agents":
                     if "connection refused" in err.lower() or "9222" in err or "connect" in err.lower():
                         st.error(
                             "Chrome not reachable on port 9222.\n\n"
-                            "**Steps to fix:**\n"
-                            "1. Close **all** Chrome windows completely (check the taskbar — right-click Chrome → Quit)\n"
-                            "2. Open Chrome using the shortcut with the flag added\n"
-                            "3. Verify it worked: open a new tab and go to **localhost:9222** — you should see a JSON page\n"
-                            "4. Then click Connect again\n\n"
-                            f"Full target: `\"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe\" --remote-debugging-port=9222 --remote-allow-origins=*`"
+                            "Run this in PowerShell to launch a Relay-ready Chrome:\n\n"
+                            "```powershell\n"
+                            'Start-Process "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" '
+                            '-ArgumentList "--remote-debugging-port=9222","--remote-allow-origins=*","--user-data-dir=C:\\relay-chrome-profile"\n'
+                            "```\n\n"
+                            "Then verify by visiting `localhost:9222` in that Chrome — should show a JSON page."
                         )
                     else:
                         st.error(err)
@@ -675,21 +675,20 @@ else:
 
     st.subheader("Chrome Setup")
     with st.container(border=True):
-        st.markdown("**One-time setup to connect Relay to your own Chrome:**")
+        st.markdown("**Run this command once to launch a Relay-dedicated Chrome window:**")
         st.code(
-            '"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" '
-            '--remote-debugging-port=9222 --remote-allow-origins=*',
-            language=None,
+            'Start-Process "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" '
+            '-ArgumentList "--remote-debugging-port=9222","--remote-allow-origins=*","--user-data-dir=C:\\relay-chrome-profile"',
+            language="powershell",
         )
         st.markdown(
-            "1. Right-click your Chrome shortcut → **Properties**\n"
-            "2. Replace the **Target** field with the line above\n"
-            "3. Close **all** Chrome windows completely, then reopen using that shortcut\n"
-            "4. Log into claude.ai, chatgpt.com, gemini.google.com, etc. as normal\n"
-            "5. Go to **Agents** → **Connect to Chrome**\n\n"
-            "**Verify it's working:** open a new Chrome tab and go to `localhost:9222` — you should see a JSON page."
+            "- Paste into **PowerShell** and press Enter\n"
+            "- A fresh Chrome window opens — log into claude.ai, chatgpt.com, etc.\n"
+            "- Go to **Agents** → **Connect to Chrome**\n"
+            "- Run this command each time you want to use Relay (logins persist)\n\n"
+            "**Verify:** open a new tab in that Chrome and go to `localhost:9222` — you should see a JSON page."
         )
-        st.caption(f"Relay connects to: `{CDP_URL}`")
+        st.caption(f"Relay connects to: `{CDP_URL}`  ·  Profile saved at `C:\\relay-chrome-profile`")
 
     st.subheader("API Keys")
     col1, col2 = st.columns(2)
