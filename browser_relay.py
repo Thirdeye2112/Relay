@@ -352,10 +352,9 @@ class BrowserManager:
                 viewport={"width": 1280, "height": 900},
                 args=[
                     "--disable-blink-features=AutomationControlled",
-                    "--force-device-scale-factor=1",  # prevents pixelation on HiDPI
+                    "--force-device-scale-factor=1",
                 ],
             )
-            # Hide webdriver flag
             ctx.add_init_script(
                 "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
             )
@@ -363,19 +362,19 @@ class BrowserManager:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             self._pages[agent] = page
 
-            # Strip `debugger;` statements from JS before they execute.
-            # This intercepts at the network layer so timing doesn't matter.
-            def _strip_debugger(route):
+            # Apply setSkipAllPauses to suppress anti-bot debugger; statements.
+            # Re-apply on every navigation since the V8 context resets.
+            def _skip(p):
                 try:
-                    resp = route.fetch()
-                    body = resp.text()
-                    if "debugger" in body:
-                        body = body.replace("debugger;", ";").replace("debugger ", " ")
-                    route.fulfill(response=resp, body=body)
+                    cdp = ctx.new_cdp_session(p)
+                    cdp.send("Debugger.enable")
+                    cdp.send("Debugger.setSkipAllPauses", {"skip": True})
+                    p.on("load", lambda: _skip(p))
                 except Exception:
-                    route.continue_()
+                    pass
 
-            ctx.route("**/*.js", _strip_debugger)
+            _skip(page)
+            ctx.on("page", _skip)
 
             site = site_for_agent(agent)
             if site and site["url_match"] not in page.url:
