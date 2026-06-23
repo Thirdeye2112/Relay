@@ -12,25 +12,23 @@ from relay import (
     append_message, Message, SESSIONS_DIR, AGENTS_FILE, AgentConfig,
 )
 try:
-    import importlib, importlib.util as _ilu
+    import importlib.util as _ilu
     _br_path = Path(__file__).parent / "browser_relay.py"
     _br_spec = _ilu.spec_from_file_location("browser_relay", _br_path)
     _br_mod  = _ilu.module_from_spec(_br_spec)
     _br_spec.loader.exec_module(_br_mod)
-    BrowserManager  = _br_mod.BrowserManager
-    site_for_agent  = _br_mod.site_for_agent
-    SITES           = _br_mod.SITES
-    profile_exists  = _br_mod.profile_exists
-    reset_profile   = _br_mod.reset_profile
+    BrowserManager = _br_mod.BrowserManager
+    site_for_agent = _br_mod.site_for_agent
+    SITES          = _br_mod.SITES
+    CDP_URL        = _br_mod.CDP_URL
     PLAYWRIGHT_AVAILABLE = True
     PLAYWRIGHT_ERROR = None
 except Exception as _pw_err:
     PLAYWRIGHT_AVAILABLE = False
     PLAYWRIGHT_ERROR = str(_pw_err)
     def site_for_agent(name): return None  # noqa: E704
-    def profile_exists(name): return False  # noqa: E704
-    def reset_profile(name): pass  # noqa: E704
     SITES = {}
+    CDP_URL = "http://localhost:9222"
 
 try:
     from github_relay import (
@@ -99,6 +97,11 @@ def agent_active(cfg) -> bool:
     key = "ANTHROPIC_API_KEY" if cfg.provider == "anthropic" else "OPENAI_API_KEY"
     return bool(os.environ.get(key, ""))
 
+def close_worker(name: str) -> None:
+    m = get_manager()
+    if m:
+        m.unassign(name)
+
 def active_agents() -> dict:
     return {n: c for n, c in agents_cfg.items() if agent_active(c)}
 
@@ -161,33 +164,40 @@ def _api_error(e: Exception) -> str:
         return "Invalid API key — check Settings"
     return f"API error: {msg[:200]}"
 
-# ── Browser manager (one window, tabs per agent) ──────────────────────────────
+# ── Browser manager ───────────────────────────────────────────────────────────
 
 def get_manager() -> Optional["BrowserManager"]:
     m = st.session_state.get("browser_manager")
     return m if (m and m.alive) else None
 
-def get_worker(name: str):
-    """Returns the manager if this agent has an open tab, else None."""
-    m = get_manager()
-    return m if (m and m.has_agent(name)) else None
+def connect_browser() -> None:
+    """Connect to the user's running Chrome and auto-assign tabs."""
+    m = BrowserManager()
+    st.session_state.browser_manager = m
+    auto_assign_tabs(m)
 
-def launch_worker(name: str) -> None:
-    """Open a tab for this agent, starting the browser if needed."""
-    m = get_manager()
-    if m is None:
-        m = BrowserManager()
-        st.session_state.browser_manager = m
-    m.open(name)
+def auto_assign_tabs(m: "BrowserManager") -> None:
+    """Scan open tabs and assign each browser agent to the first matching tab."""
+    tabs = m.scan_tabs()
+    used: set[int] = set()
+    for name, cfg in agents_cfg.items():
+        if getattr(cfg, "mode", "api") != "browser":
+            continue
+        if m.has_agent(name):
+            continue
+        site = site_for_agent(name)
+        if not site:
+            continue
+        for i, tab in enumerate(tabs):
+            if site["url_match"] in tab["url"] and i not in used:
+                try:
+                    m.assign_tab(name, i)
+                    used.add(i)
+                except Exception:
+                    pass
+                break
 
-def close_worker(name: str) -> None:
-    """Close this agent's tab."""
-    m = get_manager()
-    if m:
-        m.close_agent(name)
-
-def close_browser() -> None:
-    """Shut down the entire browser."""
+def disconnect_browser() -> None:
     m = st.session_state.pop("browser_manager", None)
     if m:
         m.close()
@@ -302,10 +312,16 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
                 if getattr(cfg, "mode", "api") == "browser":
                     mgr = get_manager()
                     if not mgr or not mgr.has_agent(name):
-                        st.error(f"{name.upper()} browser tab not open — launch it in Agents.")
+                        st.error(f"{name.upper()} has no tab — assign one in Agents.")
                         continue
+                    # Prepend system prompt on the very first user message
+                    history = load_session(sid, name)
+                    is_first = not any(m.role == "user" for m in history)
+                    msg_to_send = (
+                        f"{cfg.system_prompt}\n\n---\n\n{user_msg}" if is_first else user_msg
+                    )
                     with st.spinner(f"{name.upper()} responding…"):
-                        reply = mgr.send_message(name, user_msg)
+                        reply = mgr.send_message(name, msg_to_send)
                     st.markdown(reply)
                 else:
                     reply = st.write_stream(stream_agent(cfg, load_session(sid, name)))
@@ -489,29 +505,63 @@ elif mode == "Agents":
 
     if ea is None:
         mgr = get_manager()
-        c_hdr, c_close = st.columns([6, 2])
-        with c_hdr:
-            st.header("Agents")
-        with c_close:
-            if mgr and mgr.alive:
-                st.markdown("")
-                if st.button("Close Browser", use_container_width=True):
-                    close_browser(); st.rerun()
+        st.header("Agents")
+
+        # ── Chrome connection bar ─────────────────────────────────────────────
+        if not PLAYWRIGHT_AVAILABLE:
+            st.error(f"Playwright not available: {PLAYWRIGHT_ERROR}")
+        else:
+            with st.container(border=True):
+                cc1, cc2, cc3 = st.columns([5, 2, 2])
+                with cc1:
+                    if mgr:
+                        try:
+                            tab_count = len(mgr.scan_tabs())
+                            st.markdown(f"**🟢 Chrome connected** — {tab_count} tabs visible")
+                        except Exception:
+                            st.markdown("**🔴 Chrome disconnected**")
+                    else:
+                        st.markdown("**⚪ Chrome not connected**")
+                        st.caption(f"Launch Chrome with `--remote-debugging-port=9222`, log in to your AI accounts, then connect.")
+                with cc2:
+                    if mgr:
+                        if st.button("Re-scan tabs", use_container_width=True):
+                            auto_assign_tabs(mgr); st.rerun()
+                    else:
+                        if st.button("Connect to Chrome", type="primary", use_container_width=True):
+                            try:
+                                connect_browser(); st.rerun()
+                            except Exception as e:
+                                st.session_state["connect_err"] = str(e); st.rerun()
+                with cc3:
+                    if mgr:
+                        if st.button("Disconnect", use_container_width=True):
+                            disconnect_browser(); st.rerun()
+
+                err = st.session_state.pop("connect_err", None)
+                if err:
+                    if "connection refused" in err.lower() or "9222" in err:
+                        st.error("Chrome not reachable on port 9222 — make sure Chrome is running with `--remote-debugging-port=9222`")
+                    else:
+                        st.error(err)
+
+        st.divider()
         if not agents_cfg:
             st.info("No agents yet — click **＋ New Agent** in the sidebar.")
 
+        # ── Per-agent rows ────────────────────────────────────────────────────
         for name, cfg in agents_cfg.items():
             is_browser = getattr(cfg, "mode", "api") == "browser"
-            worker     = get_worker(name) if is_browser else None
+            has_tab    = mgr and mgr.has_agent(name) if is_browser else False
             is_on      = agent_active(cfg)
 
             with st.container(border=True):
                 c1, c2, c3, c4 = st.columns([5, 2, 1, 1])
                 with c1:
                     if is_browser:
-                        site  = site_for_agent(name)
-                        label = site["key"] if site else "browser"
-                        status = "✓" if worker else "○"
+                        site   = site_for_agent(name)
+                        label  = site["key"] if site else "browser"
+                        status = "✓" if has_tab else "○"
                         st.markdown(f"**{avatar(name)} {name.upper()}** &nbsp; {status} {label}")
                     else:
                         key_ok = bool(os.environ.get(
@@ -520,45 +570,31 @@ elif mode == "Agents":
                         st.markdown(f"**{avatar(name)} {name.upper()}** &nbsp; {'✓' if key_ok else '○'} {cfg.provider}/{cfg.model}")
 
                 with c2:
-                    if is_browser and PLAYWRIGHT_AVAILABLE:
-                        if worker:
-                            if st.button("Close", key=f"cl_{name}", use_container_width=True):
-                                close_worker(name); st.rerun()
+                    if is_browser and mgr:
+                        if has_tab:
+                            if st.button("Unassign", key=f"ua_{name}", use_container_width=True):
+                                mgr.unassign(name); st.rerun()
                         else:
-                            if st.button("Launch", key=f"lc_{name}", type="primary", use_container_width=True):
+                            if st.button("Open Tab", key=f"ot_{name}", use_container_width=True):
                                 with st.spinner(f"Opening {name.upper()}…"):
                                     try:
-                                        launch_worker(name)
-                                        st.rerun()
+                                        mgr.open_tab(name); st.rerun()
                                     except Exception as e:
-                                        st.session_state[f"launch_err_{name}"] = str(e)
-                                        st.rerun()
-                            err = st.session_state.pop(f"launch_err_{name}", None)
+                                        st.session_state[f"tab_err_{name}"] = str(e); st.rerun()
+                            err = st.session_state.pop(f"tab_err_{name}", None)
                             if err:
                                 st.error(err)
-                    elif is_browser and not PLAYWRIGHT_AVAILABLE:
-                        st.error(f"Import failed: {PLAYWRIGHT_ERROR}")
+                    elif is_browser and not mgr:
+                        st.caption("Connect Chrome first")
 
                 with c3:
                     if st.button("Edit", key=f"e_{name}"):
                         st.session_state.edit_agent = name; st.rerun()
                 with c4:
                     if st.button("Del", key=f"del_{name}"):
-                        close_worker(name)
+                        if mgr:
+                            mgr.unassign(name)
                         del agents_cfg[name]; save_agents(agents_cfg); st.rerun()
-
-            # Reset login button (only for browser agents with a saved profile)
-            if is_browser and PLAYWRIGHT_AVAILABLE:
-                if profile_exists(name):
-                    if st.button(f"↺ Reset login for {name.upper()}",
-                                 key=f"reset_{name}", use_container_width=True):
-                        close_worker(name)
-                        reset_profile(name)
-                        st.success(f"Login cleared — next Launch will ask you to sign in.")
-                        st.rerun()
-
-        if not PLAYWRIGHT_AVAILABLE:
-            st.info("Install Playwright for browser agents:\n```\npip install playwright\nplaywright install chromium\n```")
 
     elif ea == "__new__":
         st.header("New Agent")
@@ -628,6 +664,18 @@ elif mode == "Agents":
 else:
     st.header("Settings")
     st.caption("Saved locally to `keys.json` — never leaves your machine.")
+
+    st.subheader("Chrome Setup")
+    with st.container(border=True):
+        st.markdown("**One-time setup to connect Relay to your own Chrome:**")
+        st.markdown(
+            "1. Right-click your Chrome shortcut → **Properties**\n"
+            "2. In the **Target** field, add this to the end:  `--remote-debugging-port=9222`\n"
+            "3. Close all Chrome windows, then reopen using that shortcut\n"
+            "4. Log into claude.ai, chatgpt.com, gemini.google.com, etc. as normal\n"
+            "5. Go to **Agents** → **Connect to Chrome**"
+        )
+        st.caption(f"Relay connects to: `{CDP_URL}`")
 
     st.subheader("API Keys")
     col1, col2 = st.columns(2)

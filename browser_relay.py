@@ -1,36 +1,24 @@
 """
-browser_relay.py — Playwright browser automation for Relay.
+browser_relay.py — Controls your existing Chrome via CDP.
 
-One BrowserManager owns a single Playwright instance on one dedicated thread.
-Each agent gets its own persistent profile (separate login) and its own window.
-All Playwright calls are routed through the manager thread — never cross-thread.
+Setup (one time):
+  1. Right-click your Chrome shortcut → Properties
+  2. Append  --remote-debugging-port=9222  to the Target field
+  3. Open Chrome, log into claude.ai / chatgpt.com / etc.
+  4. Click "Connect to Chrome" in Relay.
+
+No separate browser windows. No profiles. No anti-bot fights.
 """
-import os
 import queue
-import shutil
-import stat
-import subprocess
 import threading
 import time
-from pathlib import Path
 from typing import Optional
 
-PROFILES_DIR = Path(__file__).parent / "browser_profiles"
+CDP_URL = "http://localhost:9222"
 
 SITES: dict[str, dict] = {
-    "chatgpt": {
-        "url":          "https://chatgpt.com",
-        "url_match":    "chatgpt.com",
-        "input":        [
-            "#prompt-textarea",
-            'div[contenteditable="true"][data-virtualkeyboard]',
-        ],
-        "stop_btn":     'button[data-testid="stop-button"]',
-        "send_btn":     'button[data-testid="send-button"]',
-        "response_sel": '[data-message-author-role="assistant"]',
-    },
     "claude": {
-        "url":          "https://claude.ai",
+        "url":          "https://claude.ai/new",
         "url_match":    "claude.ai",
         "input":        [
             'div[contenteditable="true"].ProseMirror',
@@ -45,8 +33,19 @@ SITES: dict[str, dict] = {
             ".prose",
         ],
     },
+    "chatgpt": {
+        "url":          "https://chatgpt.com/",
+        "url_match":    "chatgpt.com",
+        "input":        [
+            "#prompt-textarea",
+            'div[contenteditable="true"][data-virtualkeyboard]',
+        ],
+        "stop_btn":     'button[data-testid="stop-button"]',
+        "send_btn":     'button[data-testid="send-button"]',
+        "response_sel": '[data-message-author-role="assistant"]',
+    },
     "gemini": {
-        "url":          "https://gemini.google.com",
+        "url":          "https://gemini.google.com/",
         "url_match":    "gemini.google.com",
         "input":        [
             'rich-textarea div[contenteditable="true"]',
@@ -61,7 +60,7 @@ SITES: dict[str, dict] = {
         ],
     },
     "perplexity": {
-        "url":          "https://www.perplexity.ai",
+        "url":          "https://www.perplexity.ai/",
         "url_match":    "perplexity.ai",
         "input":        [
             'textarea[placeholder*="Ask"]',
@@ -70,14 +69,10 @@ SITES: dict[str, dict] = {
         ],
         "stop_btn":     'button[aria-label="Stop"]',
         "send_btn":     'button[aria-label="Submit"]',
-        "response_sel": [
-            ".prose",
-            ".answer-text",
-            "[class*='answer']",
-        ],
+        "response_sel": [".prose", ".answer-text", "[class*='answer']"],
     },
     "grok": {
-        "url":          "https://grok.com",
+        "url":          "https://grok.com/",
         "url_match":    "grok.com",
         "input":        ['textarea[placeholder]', 'div[contenteditable="true"]'],
         "stop_btn":     None,
@@ -85,7 +80,7 @@ SITES: dict[str, dict] = {
         "response_sel": [".message-content", "[class*='response']"],
     },
     "copilot": {
-        "url":          "https://copilot.microsoft.com",
+        "url":          "https://copilot.microsoft.com/",
         "url_match":    "copilot.microsoft.com",
         "input":        ['textarea[placeholder]', 'div[contenteditable="true"]'],
         "stop_btn":     None,
@@ -96,42 +91,14 @@ SITES: dict[str, dict] = {
 
 
 def site_for_agent(agent_name: str) -> Optional[dict]:
-    key_name = agent_name.lower().replace("_", "").replace(" ", "").replace("-", "")
-    for key, cfg in SITES.items():
-        if key in key_name:
-            return {"key": key, **cfg}
+    key = agent_name.lower().replace("_", "").replace(" ", "").replace("-", "")
+    for site_key, cfg in SITES.items():
+        if site_key in key:
+            return {"key": site_key, **cfg}
     return None
 
 
-def profile_exists(agent_name: str) -> bool:
-    """True if this agent has a saved browser profile (i.e. has logged in before)."""
-    p = PROFILES_DIR / agent_name
-    return p.exists() and any(p.iterdir())
-
-
-def reset_profile(agent_name: str) -> None:
-    """Delete the agent's saved profile so it gets a fresh login next launch."""
-    p = PROFILES_DIR / agent_name
-    if not p.exists():
-        return
-    # Windows holds file locks briefly after Chrome closes — retry a few times
-    def _force_remove(func, path, _):
-        try:
-            os.chmod(path, stat.S_IWRITE)
-            func(path)
-        except Exception:
-            pass
-    for attempt in range(5):
-        try:
-            shutil.rmtree(p, onerror=_force_remove)
-            return
-        except PermissionError:
-            time.sleep(1)
-    # Last attempt — remove what we can, leave locked files
-    shutil.rmtree(p, ignore_errors=True)
-
-
-# ── Page helpers ───────────────────────────────────────────────────────────────
+# ── Page helpers ────────────────────────────────────────────────────────────────
 
 def _resolve_selector(page, selectors, timeout: int = 8000):
     if isinstance(selectors, str):
@@ -151,8 +118,8 @@ def _type_and_submit(page, site: dict, message: str) -> None:
     loc = _resolve_selector(page, site["input"])
     if loc is None:
         raise RuntimeError(
-            f"Input box not found (tried: {site['input']}). "
-            "Is the page loaded and are you logged in?"
+            f"Input box not found on {page.url}. "
+            "Is the page fully loaded and are you logged in?"
         )
     el = loc.last
     el.click()
@@ -231,79 +198,66 @@ def _read_last_response(page, site: dict) -> str:
     return "[No response text found — check the browser window]"
 
 
-def _kill_chrome_using_profile(profile_dir: str) -> None:
-    """Kill any Chrome/Chromium process holding a lock on this profile directory."""
-    try:
-        subprocess.run([
-            "powershell", "-NoProfile", "-Command",
-            f"Get-CimInstance Win32_Process -Filter \"name='chrome.exe'\" | "
-            f"Where-Object {{$_.CommandLine -like '*{profile_dir}*'}} | "
-            f"ForEach-Object {{Stop-Process -Id $_.ProcessId -Force "
-            f"-ErrorAction SilentlyContinue}}",
-        ], capture_output=True, timeout=8)
-        time.sleep(0.8)  # give Windows time to release file handles
-    except Exception:
-        pass
-
-
-# ── BrowserManager ─────────────────────────────────────────────────────────────
+# ── BrowserManager ──────────────────────────────────────────────────────────────
 
 class BrowserManager:
     """
-    Manages one Playwright instance on a single dedicated thread.
-    Each agent gets its own persistent context (profile) and window,
-    so logins are completely independent per agent.
+    Connects to an already-running Chrome via CDP (port 9222).
+    Agents map to existing tabs by URL match — no new Chrome windows opened.
     """
 
     def __init__(self):
-        self._cmd_q    = queue.Queue()
-        self._ready_q  = queue.Queue()
-        self._contexts: dict[str, object] = {}
-        self._pages:    dict[str, object] = {}
-        self._thread   = threading.Thread(
+        self._cmd_q   = queue.Queue()
+        self._ready_q = queue.Queue()
+        self._pages: dict[str, object] = {}  # agent_name -> page
+        self._browser = None
+        self._thread  = threading.Thread(
             target=self._run, daemon=True, name="browser-manager"
         )
         self._thread.start()
-        try:
-            status, val = self._ready_q.get(timeout=30)
-        except queue.Empty:
-            raise RuntimeError(
-                "Browser manager failed to start. "
-                "Run: python -m playwright install chromium"
-            )
+        status, val = self._ready_q.get(timeout=15)
         if status == "error":
             raise RuntimeError(val)
 
-    # ── Thread ────────────────────────────────────────────────────────────────
+    # ── Thread ───────────────────────────────────────────────────────────────
 
     def _run(self):
         try:
             from playwright.sync_api import sync_playwright
             with sync_playwright() as pw:
-                self._pw = pw
-                self._ready_q.put(("ok", None))
+                try:
+                    self._browser = pw.chromium.connect_over_cdp(CDP_URL)
+                    self._ready_q.put(("ok", None))
+                except Exception as e:
+                    self._ready_q.put(("error", str(e)))
+                    return
 
                 while True:
                     try:
-                        cmd = self._cmd_q.get(timeout=1)
+                        cmd = self._cmd_q.get(timeout=2)
                     except queue.Empty:
                         self._heartbeat()
                         continue
 
                     if cmd is None:
-                        self._close_all()
                         break
 
                     action, agent, payload, res_q = cmd
                     try:
-                        if   action == "open":   self._do_open(agent, res_q)
-                        elif action == "send":   self._do_send(agent, payload, res_q)
-                        elif action == "close":  self._do_close(agent, res_q)
-                        elif action == "status": self._do_status(agent, res_q)
-                        elif action == "list":   res_q.put(("ok", list(self._pages.keys())))
+                        if   action == "scan":     self._do_scan(res_q)
+                        elif action == "assign":   self._do_assign(agent, payload, res_q)
+                        elif action == "open_tab": self._do_open_tab(agent, res_q)
+                        elif action == "send":     self._do_send(agent, payload, res_q)
+                        elif action == "unassign":
+                            self._pages.pop(agent, None)
+                            res_q.put(("ok", None))
+                        elif action == "list":
+                            res_q.put(("ok", list(self._pages.keys())))
+                        elif action == "has":
+                            page = self._pages.get(agent)
+                            res_q.put(("ok", page is not None and not page.is_closed()))
                     except Exception as e:
                         res_q.put(("error", str(e)))
-
         except Exception as e:
             try:
                 self._ready_q.put(("error", str(e)))
@@ -311,159 +265,102 @@ class BrowserManager:
                 pass
 
     def _heartbeat(self):
-        dead = []
-        for name, ctx in self._contexts.items():
-            try:
-                _ = ctx.pages
-            except Exception:
-                dead.append(name)
-        for name in dead:
-            self._contexts.pop(name, None)
-            self._pages.pop(name, None)
+        dead = [n for n, p in self._pages.items() if p.is_closed()]
+        for n in dead:
+            self._pages.pop(n, None)
 
-    def _close_all(self):
-        for ctx in list(self._contexts.values()):
-            try:
-                ctx.close()
-            except Exception:
-                pass
-        self._contexts.clear()
-        self._pages.clear()
+    def _all_pages(self) -> list:
+        pages = []
+        if self._browser:
+            for ctx in self._browser.contexts:
+                pages.extend(ctx.pages)
+        return pages
 
-    def _do_open(self, agent: str, res_q):
-        # Close stale Playwright context for this agent if present
-        if agent in self._contexts:
-            try:
-                self._contexts[agent].pages  # probe
-            except Exception:
-                self._contexts.pop(agent, None)
-                self._pages.pop(agent, None)
+    def _do_scan(self, res_q):
+        tabs = [{"url": p.url, "title": p.title()} for p in self._all_pages()]
+        res_q.put(("ok", tabs))
 
-        if agent not in self._contexts:
-            profile = PROFILES_DIR / agent
-            profile.mkdir(parents=True, exist_ok=True)
+    def _do_assign(self, agent: str, page_index: int, res_q):
+        pages = self._all_pages()
+        if 0 <= page_index < len(pages):
+            self._pages[agent] = pages[page_index]
+            res_q.put(("ok", None))
+        else:
+            res_q.put(("error", f"Tab index {page_index} out of range"))
 
-            # Kill any Chrome process still holding this profile (exit code 21 guard)
-            _kill_chrome_using_profile(str(profile))
-
-            ctx = self._pw.chromium.launch_persistent_context(
-                str(profile),
-                headless=False,
-                viewport={"width": 1280, "height": 900},
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--force-device-scale-factor=1",
-                ],
-            )
-            ctx.add_init_script(
-                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
-            )
-            self._contexts[agent] = ctx
-            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    def _do_open_tab(self, agent: str, res_q):
+        site = site_for_agent(agent)
+        if not site:
+            res_q.put(("error", f"No site configured for '{agent}'"))
+            return
+        try:
+            ctx = self._browser.contexts[0]
+            page = ctx.new_page()
+            page.goto(site["url"], wait_until="domcontentloaded", timeout=30_000)
             self._pages[agent] = page
-
-            # Navigate to blank first so any saved-session page stops loading.
-            try:
-                page.goto("about:blank", wait_until="commit", timeout=5_000)
-            except Exception:
-                pass
-
-            # Auto-resume any debugger pause — works regardless of timing.
-            # Listens for Debugger.paused events and immediately resumes,
-            # so anti-bot `debugger;` statements never freeze the browser.
-            def _auto_resume(p):
-                try:
-                    cdp = ctx.new_cdp_session(p)
-                    cdp.send("Debugger.enable")
-                    cdp.on("Debugger.paused", lambda _: cdp.send("Debugger.resume"))
-                except Exception:
-                    pass
-
-            _auto_resume(page)
-            ctx.on("page", _auto_resume)
-
-            site = site_for_agent(agent)
-            if site:
-                page.goto(site["url"], wait_until="domcontentloaded", timeout=30_000)
-
-        res_q.put(("ok", None))
+            res_q.put(("ok", None))
+        except Exception as e:
+            res_q.put(("error", str(e)))
 
     def _do_send(self, agent: str, payload, res_q):
         page = self._pages.get(agent)
         if page is None or page.is_closed():
-            raise RuntimeError(f"No open window for '{agent}' — launch it first")
+            res_q.put(("error", f"No tab assigned to '{agent}' — assign one in Agents."))
+            return
         site = site_for_agent(agent)
         if site is None:
-            raise RuntimeError(f"Unknown site for agent '{agent}'")
+            res_q.put(("error", f"Unknown site for agent '{agent}'"))
+            return
         msg, timeout = payload
         page.bring_to_front()
         _type_and_submit(page, site, msg)
         reply = _wait_and_read(page, site, timeout)
         res_q.put(("ok", reply))
 
-    def _do_close(self, agent: str, res_q):
-        ctx = self._contexts.pop(agent, None)
-        self._pages.pop(agent, None)
-        if ctx:
-            try:
-                ctx.close()
-            except Exception:
-                pass
-        res_q.put(("ok", None))
-
-    def _do_status(self, agent: str, res_q):
-        page = self._pages.get(agent)
-        if page and not page.is_closed():
-            try:
-                res_q.put(("ok", {"url": page.url, "title": page.title()}))
-                return
-            except Exception:
-                pass
-        res_q.put(("ok", {}))
-
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def _call(self, action: str, agent: str, payload=None, timeout: int = 40):
+    def _call(self, action: str, agent: str = "", payload=None, timeout: int = 40):
         res_q = queue.Queue()
         self._cmd_q.put((action, agent, payload, res_q))
-        try:
-            status, val = res_q.get(timeout=timeout)
-        except queue.Empty:
-            raise RuntimeError(f"Timed out on '{action}' for '{agent}'")
+        status, val = res_q.get(timeout=timeout)
         if status == "error":
             raise RuntimeError(val)
         return val
 
-    def open(self, agent_name: str) -> None:
-        self._call("open", agent_name, timeout=45)
+    def scan_tabs(self) -> list[dict]:
+        return self._call("scan", timeout=5)
 
-    def send_message(self, agent_name: str, message: str, timeout: int = 120) -> str:
-        return self._call("send", agent_name, (message, timeout), timeout=timeout + 30)
+    def assign_tab(self, agent: str, tab_index: int) -> None:
+        self._call("assign", agent, tab_index, timeout=5)
 
-    def close_agent(self, agent_name: str) -> None:
-        self._call("close", agent_name, timeout=10)
+    def open_tab(self, agent: str) -> None:
+        """Open a new tab in Chrome and navigate to the agent's site."""
+        self._call("open_tab", agent, timeout=35)
 
-    def status(self, agent_name: str) -> dict:
+    def send_message(self, agent: str, message: str, timeout: int = 120) -> str:
+        return self._call("send", agent, (message, timeout), timeout=timeout + 30)
+
+    def has_agent(self, agent: str) -> bool:
         try:
-            return self._call("status", agent_name, timeout=5) or {}
-        except Exception:
-            return {}
-
-    def has_agent(self, agent_name: str) -> bool:
-        try:
-            return bool(self.status(agent_name))
+            return self._call("has", agent, timeout=3)
         except Exception:
             return False
 
+    def unassign(self, agent: str) -> None:
+        try:
+            self._call("unassign", agent, timeout=3)
+        except Exception:
+            pass
+
     def active_agents(self) -> list:
         try:
-            return self._call("list", "", timeout=5)
+            return self._call("list", timeout=3)
         except Exception:
             return []
 
     def close(self) -> None:
         self._cmd_q.put(None)
-        self._thread.join(timeout=10)
+        self._thread.join(timeout=5)
 
     @property
     def alive(self) -> bool:
