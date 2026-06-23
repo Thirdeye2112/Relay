@@ -210,6 +210,7 @@ class BrowserManager:
         self._cmd_q   = queue.Queue()
         self._ready_q = queue.Queue()
         self._pages: dict[str, object] = {}  # agent_name -> page
+        self._cdp_sessions: list = []        # keep refs alive so listeners aren't GC'd
         self._browser = None
         self._thread  = threading.Thread(
             target=self._run, daemon=True, name="browser-manager"
@@ -289,11 +290,12 @@ class BrowserManager:
             res_q.put(("error", f"Tab index {page_index} out of range"))
 
     def _arm_auto_resume(self, page) -> None:
-        """Auto-resume any debugger pause on this page (handles anti-bot debugger; statements)."""
+        """Auto-resume debugger pauses — keeps cdp ref alive so listener isn't GC'd."""
         try:
             cdp = page.context.new_cdp_session(page)
             cdp.send("Debugger.enable")
             cdp.on("Debugger.paused", lambda _: cdp.send("Debugger.resume"))
+            self._cdp_sessions.append(cdp)  # prevent garbage collection
         except Exception:
             pass
 
@@ -306,8 +308,10 @@ class BrowserManager:
             ctx = self._browser.contexts[0]
             page = ctx.new_page()
             self._arm_auto_resume(page)
-            page.goto(site["url"], wait_until="domcontentloaded", timeout=30_000)
             self._pages[agent] = page
+            # "commit" returns as soon as the server responds — before any JS runs.
+            # The page keeps loading in the background, freeing the queue immediately.
+            page.goto(site["url"], wait_until="commit", timeout=15_000)
             res_q.put(("ok", None))
         except Exception as e:
             res_q.put(("error", str(e)))
