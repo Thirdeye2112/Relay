@@ -350,10 +350,12 @@ class BrowserManager:
                 str(profile),
                 headless=False,
                 viewport={"width": 1280, "height": 900},
-                args=["--disable-blink-features=AutomationControlled"],
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--force-device-scale-factor=1",  # prevents pixelation on HiDPI
+                ],
             )
-            # Suppress navigator.webdriver and disable the JS debugger so
-            # anti-bot `debugger;` statements don't pause the browser.
+            # Hide webdriver flag
             ctx.add_init_script(
                 "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
             )
@@ -361,18 +363,19 @@ class BrowserManager:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             self._pages[agent] = page
 
-            # Skip all debugger pauses — handles anti-bot `debugger;` statements.
-            # Must enable first, then setSkipAllPauses, applied to every page.
-            def _skip_debugger(p):
+            # Strip `debugger;` statements from JS before they execute.
+            # This intercepts at the network layer so timing doesn't matter.
+            def _strip_debugger(route):
                 try:
-                    cdp = ctx.new_cdp_session(p)
-                    cdp.send("Debugger.enable")
-                    cdp.send("Debugger.setSkipAllPauses", {"skip": True})
+                    resp = route.fetch()
+                    body = resp.text()
+                    if "debugger" in body:
+                        body = body.replace("debugger;", ";").replace("debugger ", " ")
+                    route.fulfill(response=resp, body=body)
                 except Exception:
-                    pass
+                    route.continue_()
 
-            _skip_debugger(page)
-            ctx.on("page", _skip_debugger)  # apply to any new tabs/popups too
+            ctx.route("**/*.js", _strip_debugger)
 
             site = site_for_agent(agent)
             if site and site["url_match"] not in page.url:
