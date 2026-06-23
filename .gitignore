@@ -11,6 +11,7 @@ keys.json
 # Local data
 sessions/
 browser_profiles/
+debug/
 
 # Python
 __pycache__/

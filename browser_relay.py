@@ -12,6 +12,7 @@ No separate browser windows. No profiles. No anti-bot fights.
 import queue
 import threading
 import time
+from pathlib import Path
 from typing import Optional
 
 CDP_URL = "http://localhost:9222"
@@ -104,27 +105,41 @@ def site_for_agent(agent_name: str) -> Optional[dict]:
 # ── Page helpers ────────────────────────────────────────────────────────────────
 
 def _resolve_selector(page, selectors, timeout: int = 8000):
+    """Resolve to a single, VISIBLE matching element.
+
+    Hidden/decoy duplicates (legacy SEO textareas, off-screen mobile
+    variants, etc.) are skipped -- matching a hidden element and typing
+    into it is indistinguishable from doing nothing, which is exactly
+    what broke Perplexity's input. Returns the element itself (already
+    resolved), not a multi-match Locator -- callers no longer need `.last`.
+    """
     if isinstance(selectors, str):
         selectors = [selectors]
     for sel in selectors:
         try:
             page.wait_for_selector(sel, timeout=timeout)
             loc = page.locator(sel)
-            if loc.count() > 0:
-                return loc
+            n = loc.count()
+            for i in range(n - 1, -1, -1):
+                candidate = loc.nth(i)
+                try:
+                    if candidate.is_visible():
+                        return candidate
+                except Exception:
+                    continue
         except Exception:
             continue
     return None
 
 
-def _type_and_submit(page, site: dict, message: str) -> None:
-    loc = _resolve_selector(page, site["input"])
-    if loc is None:
+def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
+    el = _resolve_selector(page, site["input"])
+    if el is None:
         raise RuntimeError(
-            f"Input box not found on {page.url}. "
+            f"Input box not found on {page.url} (no VISIBLE match in {site['input']}). "
             "Is the page fully loaded and are you logged in?"
         )
-    el = loc.last
+    _save_debug(page, agent, "01_before_type")
     el.click()
     # Choose insertion method based on element type:
     # - textarea/input: fill() works natively and triggers React state
@@ -132,13 +147,10 @@ def _type_and_submit(page, site: dict, message: str) -> None:
     tag = el.evaluate("el => el.tagName.toLowerCase()")
     if tag in ("textarea", "input"):
         el.fill(message)
-        # Trigger React's synthetic events so the send button activates
-        page.evaluate(
-            "sel => { const el = document.querySelector(sel); "
-            "if (el) { el.dispatchEvent(new Event('input', {bubbles:true})); "
-            "el.dispatchEvent(new Event('change', {bubbles:true})); } }",
-            site["input"][0] if isinstance(site["input"], list) else site["input"],
-        )
+        # Trigger React's synthetic events on the SAME element we just filled
+        # (re-querying by selector could hit a different match than _resolve_selector did).
+        el.dispatch_event("input")
+        el.dispatch_event("change")
     else:
         page.evaluate(
             "text => { document.execCommand('selectAll'); "
@@ -192,26 +204,67 @@ def _page_text(page) -> str:
         return ""
 
 
-def _wait_and_read(page, site: dict, timeout: int, pre_len: int = 0) -> str:
+DEBUG_DIR = Path(__file__).parent / "debug"
+
+def _save_debug(page, agent: str, tag: str) -> None:
+    """Screenshot + a note on what actually happened, on disk for inspection.
+
+    After this many rounds of guessing at selectors blind, the faster path
+    is to look at exactly what Relay saw at the moment something went wrong
+    instead of proposing another speculative selector tweak.
+    """
+    if not agent:
+        return
+    try:
+        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        base = DEBUG_DIR / f"{agent}_{tag}_{stamp}"
+        page.screenshot(path=str(base.with_suffix(".png")))
+        base.with_suffix(".url.txt").write_text(page.url, encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _response_counts(page, site: dict) -> dict:
+    resp_sels = site.get("response_sel", [])
+    if isinstance(resp_sels, str):
+        resp_sels = [resp_sels]
+    counts = {}
+    for sel in resp_sels:
+        try:
+            counts[sel] = page.locator(sel).count()
+        except Exception:
+            counts[sel] = 0
+    return counts
+
+
+def _wait_and_read(page, site: dict, timeout: int, pre_len: int = 0,
+                    pre_counts: dict | None = None, agent: str = "") -> str:
     """Wait for the AI response then return it.
 
     Strategy:
     1. Try the site's stop-button selector to detect generation start/end.
-    2. If the selector doesn't match, fall back to watching page-text grow
-       and stabilise — selector-agnostic, works even when DOM class names drift.
-    3. Extract response: try CSS selectors first, then return the page-text diff
-       (everything that appeared after pre_len) as an unambiguous fallback.
+    2. If that selector doesn't match (DOM drift), wait for a NEW response
+       element to actually appear in the DOM before doing anything else.
+       This is the critical fix: a naive "page text stopped changing" check
+       can't tell a multi-second "thinking" pause (no new element yet, text
+       flat) from "done responding" (also flat) -- it was firing during the
+       thinking pause and returning the user's own echoed message instead
+       of the reply. Waiting for element-count to increase first means the
+       stability check never even starts until real content exists.
+    3. Extract response: try CSS selectors first, then return the page-text
+       diff (everything new since before we typed) as a last resort.
     """
     stop_sel = site.get("stop_btn")
     appeared = False
     if stop_sel:
-        for _ in range(30):
+        for _ in range(10):
             try:
-                page.wait_for_selector(stop_sel, timeout=1000)
+                page.wait_for_selector(stop_sel, timeout=500)
                 appeared = True
                 break
             except Exception:
-                time.sleep(0.5)
+                time.sleep(0.3)
         if appeared:
             try:
                 page.wait_for_selector(stop_sel, state="hidden", timeout=timeout * 1000)
@@ -219,9 +272,22 @@ def _wait_and_read(page, site: dict, timeout: int, pre_len: int = 0) -> str:
                 pass
 
     if not appeared:
-        # Selector-agnostic wait: poll body.innerText length until stable
         deadline = time.time() + timeout
-        time.sleep(2)
+
+        # Wait for a NEW response element before checking stability at all.
+        if pre_counts:
+            new_el_seen = False
+            while time.time() < deadline:
+                cur_counts = _response_counts(page, site)
+                if any(cur_counts.get(sel, 0) > n for sel, n in pre_counts.items()):
+                    new_el_seen = True
+                    break
+                time.sleep(0.5)
+            if not new_el_seen:
+                _save_debug(page, agent, "03_no_new_element_appeared")
+
+        # Now check page-text stability (skips the thinking-pause window above).
+        time.sleep(1)
         prev_len = len(_page_text(page))
         stable = 0
         while time.time() < deadline:
@@ -230,7 +296,7 @@ def _wait_and_read(page, site: dict, timeout: int, pre_len: int = 0) -> str:
                 stable += 1
                 if stable >= 3:
                     break
-            elif cur_len != prev_len:
+            else:
                 stable = 0
             prev_len = cur_len
             time.sleep(1)
@@ -250,6 +316,7 @@ def _wait_and_read(page, site: dict, timeout: int, pre_len: int = 0) -> str:
         if len(new_text) > 50:
             return new_text
 
+    _save_debug(page, agent, "04_no_response_captured")
     return "[No response captured — check the browser window]"
 
 
@@ -411,9 +478,10 @@ class BrowserManager:
             return
         msg, timeout = payload
         page.bring_to_front()
-        pre_len = len(_page_text(page))   # snapshot before typing
-        _type_and_submit(page, site, msg)
-        reply = _wait_and_read(page, site, timeout, pre_len)
+        pre_len = len(_page_text(page))           # snapshot before typing
+        pre_counts = _response_counts(page, site)  # element counts before typing
+        _type_and_submit(page, site, msg, agent)
+        reply = _wait_and_read(page, site, timeout, pre_len, pre_counts, agent)
         res_q.put(("ok", reply))
 
     # ── Public API ────────────────────────────────────────────────────────────
