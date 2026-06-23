@@ -362,22 +362,23 @@ class BrowserManager:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             self._pages[agent] = page
 
-            # Apply setSkipAllPauses to suppress anti-bot debugger; statements.
-            # Re-apply on every navigation since the V8 context resets.
-            def _skip(p):
-                try:
-                    cdp = ctx.new_cdp_session(p)
-                    cdp.send("Debugger.enable")
-                    cdp.send("Debugger.setSkipAllPauses", {"skip": True})
-                    p.on("load", lambda: _skip(p))
-                except Exception:
-                    pass
+            # Navigate to blank first so any saved-session page stops loading.
+            # This guarantees our CDP command lands before any site JS runs.
+            try:
+                page.goto("about:blank", wait_until="commit", timeout=5_000)
+            except Exception:
+                pass
 
-            _skip(page)
-            ctx.on("page", _skip)
+            # Now send setSkipAllPauses — page is idle, no race condition.
+            try:
+                cdp = ctx.new_cdp_session(page)
+                cdp.send("Debugger.enable")
+                cdp.send("Debugger.setSkipAllPauses", {"skip": True})
+            except Exception:
+                pass
 
             site = site_for_agent(agent)
-            if site and site["url_match"] not in page.url:
+            if site:
                 page.goto(site["url"], wait_until="domcontentloaded", timeout=30_000)
 
         res_q.put(("ok", None))
