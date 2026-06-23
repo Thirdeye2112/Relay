@@ -361,12 +361,18 @@ class BrowserManager:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             self._pages[agent] = page
 
-            # Disable CDP debugger on the page so `debugger;` is a no-op
-            try:
-                cdp = ctx.new_cdp_session(page)
-                cdp.send("Debugger.disable")
-            except Exception:
-                pass
+            # Skip all debugger pauses — handles anti-bot `debugger;` statements.
+            # Must enable first, then setSkipAllPauses, applied to every page.
+            def _skip_debugger(p):
+                try:
+                    cdp = ctx.new_cdp_session(p)
+                    cdp.send("Debugger.enable")
+                    cdp.send("Debugger.setSkipAllPauses", {"skip": True})
+                except Exception:
+                    pass
+
+            _skip_debugger(page)
+            ctx.on("page", _skip_debugger)  # apply to any new tabs/popups too
 
             site = site_for_agent(agent)
             if site and site["url_match"] not in page.url:
