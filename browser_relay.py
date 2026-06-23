@@ -315,8 +315,8 @@ class BrowserManager:
             return
         try:
             ctx = self._browser.contexts[0]
+            # new_page() triggers ctx.on("page") which arms auto-resume globally
             page = ctx.new_page()
-            self._arm_auto_resume(page)
             # "commit" returns as soon as the server responds — before JS runs.
             # Assign after goto so a failed navigation doesn't leave a broken entry.
             page.goto(site["url"], wait_until="commit", timeout=15_000)
