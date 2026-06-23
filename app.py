@@ -342,13 +342,13 @@ with st.sidebar:
             st.caption("No conversations yet.")
 
         st.divider()
-        if not active:
-            st.warning("No active agents — add keys in **Settings** or launch a browser in **Agents**.")
-        else:
-            st.subheader("New Conversation")
+        st.subheader("New Conversation")
+        if active:
             st.caption("  ".join(f"{avatar(n)} {n.upper()}" for n in active))
-            topic       = st.text_input("Topic", placeholder="e.g. Is AGI near?")
-            new_chat_btn = st.button("＋ Start", type="primary", use_container_width=True)
+        else:
+            st.caption("⚠ No agents active — launch browsers in **Agents** first.")
+        topic        = st.text_input("Topic", placeholder="e.g. Is AGI near?")
+        new_chat_btn = st.button("＋ Start", type="primary", use_container_width=True)
 
     elif mode == "Agents":
         st.subheader("Agents")
@@ -374,23 +374,24 @@ with st.sidebar:
 # ── CONVERSATIONS ─────────────────────────────────────────────────────────────
 
 if mode == "Conversations":
-    if not active:
-        st.info("Add API keys in **Settings** or launch a browser agent in **Agents** to get started.")
-
-    elif "new_chat_btn" in dir() and new_chat_btn:
+    if new_chat_btn:
         if not topic.strip():
             st.warning("Enter a topic.")
+        elif not agents_cfg:
+            st.warning("No agents configured — add some in **Agents**.")
         else:
+            # Include all configured agents in the session; they join when launched
+            all_names = list(agents_cfg.keys())
             ts  = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
             sid = f"conv-{ts}"
             meta = {
                 "session_id": sid, "type": "group_chat",
-                "topic":      topic.strip(), "agents": list(active.keys()),
+                "topic":      topic.strip(), "agents": all_names,
                 "created":    datetime.datetime.now().isoformat(),
             }
             save_meta(sid, meta)
-            for name, cfg in active.items():
-                others = [n for n in active if n != name]
+            for name, cfg in agents_cfg.items():
+                others = [n for n in all_names if n != name]
                 sys_prompt = (
                     f"You are {name.upper()}. You are in a group conversation with "
                     f"{', '.join(o.upper() for o in others)}.\n"
@@ -417,7 +418,7 @@ if mode == "Conversations":
         st.caption("  ·  ".join(f"{avatar(n)} {n.upper()}" for n in session_agents))
 
         if missing:
-            st.warning(f"No active key for: {', '.join(n.upper() for n in missing)} — sitting this round out.")
+            st.warning(f"Not yet launched: {', '.join(n.upper() for n in missing)} — open them in **Agents** to join.")
 
         # GitHub link
         repo = get_github_repo()
@@ -431,7 +432,7 @@ if mode == "Conversations":
         render_display(sid)
 
         if not participants:
-            st.error("No agents have active keys for this session.")
+            st.info("No browsers open yet — launch agents in the **Agents** tab, then come back and send a message.")
         else:
             synthesize = st.toggle("🔮 Synthesizer", value=True,
                                    help="After each round, a neutral pass summarizes agreements, tensions, and missed angles.")
@@ -470,17 +471,16 @@ elif mode == "Agents":
             with st.container(border=True):
                 c1, c2, c3, c4 = st.columns([5, 2, 1, 1])
                 with c1:
-                    st.markdown(f"### {avatar(name)} {name.upper()}")
                     if is_browser:
                         site  = site_for_agent(name)
-                        label = site["url"] if site else "unknown site"
-                        st.caption(f"🌐 browser · {label} · {'✓ open' if worker else '○ closed'}")
+                        label = site["key"] if site else "browser"
+                        status = "✓" if worker else "○"
+                        st.markdown(f"**{avatar(name)} {name.upper()}** &nbsp; {status} {label}")
                     else:
                         key_ok = bool(os.environ.get(
                             "ANTHROPIC_API_KEY" if cfg.provider == "anthropic" else "OPENAI_API_KEY", ""
                         ))
-                        st.caption(f"API · {cfg.provider} / {cfg.model} · {'✓ key set' if key_ok else '○ no key'}")
-                    st.markdown(cfg.system_prompt[:180] + ("…" if len(cfg.system_prompt) > 180 else ""))
+                        st.markdown(f"**{avatar(name)} {name.upper()}** &nbsp; {'✓' if key_ok else '○'} {cfg.provider}/{cfg.model}")
 
                 with c2:
                     if is_browser and PLAYWRIGHT_AVAILABLE:
