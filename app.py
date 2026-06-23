@@ -341,7 +341,8 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
                 else:
                     reply = st.write_stream(stream_agent(cfg, load_session(sid, name)))
             except Exception as e:
-                st.error(_api_error(e) if getattr(cfg, "mode", "api") != "browser" else str(e))
+                err_msg = str(e)
+                st.error(f"**{name.upper()} failed:** {err_msg}")
                 continue
         replies[name] = reply
         append_display(sid, {"type": "reply", "agent": name, "content": reply})

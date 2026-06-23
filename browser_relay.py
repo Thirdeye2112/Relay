@@ -123,16 +123,24 @@ def _type_and_submit(page, site: dict, message: str) -> None:
         )
     el = loc.last
     el.click()
-    # fill() is instant regardless of message length — type() with delay
-    # times out on long messages (2000 chars × 15ms = 30s = timeout)
-    el.fill(message)
-    time.sleep(0.2)
+    # execCommand('insertText') inserts the full text at once.
+    # Works with ProseMirror/rich-text editors; fill() does not trigger
+    # their internal state updates and type() times out on long messages.
+    page.evaluate(
+        "text => { document.execCommand('selectAll'); "
+        "document.execCommand('insertText', false, text); }",
+        message,
+    )
+    # Wait for the editor to fully register the input before submitting.
+    time.sleep(0.8)
 
     submitted = False
     send_sel = site.get("send_btn")
     if send_sel:
         try:
             btn = page.locator(send_sel)
+            # Wait up to 3s for the send button to become enabled after input
+            btn.first.wait_for(state="visible", timeout=3000)
             if btn.count() > 0 and btn.first.is_enabled():
                 btn.first.click()
                 submitted = True
