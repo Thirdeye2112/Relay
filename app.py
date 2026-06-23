@@ -2,6 +2,7 @@
 """relay/app.py — Run: python -m streamlit run app.py"""
 
 import os, sys, json, datetime
+from typing import Optional
 import streamlit as st
 from pathlib import Path
 
@@ -11,7 +12,7 @@ from relay import (
     append_message, Message, SESSIONS_DIR, AGENTS_FILE, AgentConfig,
 )
 try:
-    from browser_relay import BrowserWorker, site_for_agent, SITES
+    from browser_relay import BrowserManager, site_for_agent, SITES
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
@@ -78,7 +79,8 @@ def avatar(name: str) -> str:
 
 def agent_active(cfg) -> bool:
     if getattr(cfg, "mode", "api") == "browser":
-        return bool(get_worker(cfg.name))
+        m = get_manager()
+        return bool(m and m.has_agent(cfg.name))
     key = "ANTHROPIC_API_KEY" if cfg.provider == "anthropic" else "OPENAI_API_KEY"
     return bool(os.environ.get(key, ""))
 
@@ -144,24 +146,36 @@ def _api_error(e: Exception) -> str:
         return "Invalid API key — check Settings"
     return f"API error: {msg[:200]}"
 
-# ── Browser workers ───────────────────────────────────────────────────────────
+# ── Browser manager (one window, tabs per agent) ──────────────────────────────
 
-if "browser_workers" not in st.session_state:
-    st.session_state.browser_workers = {}
+def get_manager() -> Optional["BrowserManager"]:
+    m = st.session_state.get("browser_manager")
+    return m if (m and m.alive) else None
 
 def get_worker(name: str):
-    w = st.session_state.browser_workers.get(name)
-    return w if (w and w.alive) else None
+    """Returns the manager if this agent has an open tab, else None."""
+    m = get_manager()
+    return m if (m and m.has_agent(name)) else None
 
 def launch_worker(name: str) -> None:
-    if get_worker(name):
-        return
-    st.session_state.browser_workers[name] = BrowserWorker(name)
+    """Open a tab for this agent, starting the browser if needed."""
+    m = get_manager()
+    if m is None:
+        m = BrowserManager()
+        st.session_state.browser_manager = m
+    m.open(name)
 
 def close_worker(name: str) -> None:
-    w = st.session_state.browser_workers.pop(name, None)
-    if w:
-        w.close()
+    """Close this agent's tab."""
+    m = get_manager()
+    if m:
+        m.close_agent(name)
+
+def close_browser() -> None:
+    """Shut down the entire browser."""
+    m = st.session_state.pop("browser_manager", None)
+    if m:
+        m.close()
 
 # ── Sessions ──────────────────────────────────────────────────────────────────
 
@@ -271,12 +285,12 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
             st.markdown(f"**{name.upper()}**")
             try:
                 if getattr(cfg, "mode", "api") == "browser":
-                    worker = get_worker(name)
-                    if not worker:
-                        st.error(f"{name.upper()} browser not open — launch it in Agents.")
+                    mgr = get_manager()
+                    if not mgr or not mgr.has_agent(name):
+                        st.error(f"{name.upper()} browser tab not open — launch it in Agents.")
                         continue
                     with st.spinner(f"{name.upper()} responding…"):
-                        reply = worker.send_message(user_msg)
+                        reply = mgr.send_message(name, user_msg)
                     st.markdown(reply)
                 else:
                     reply = st.write_stream(stream_agent(cfg, load_session(sid, name)))
@@ -459,7 +473,15 @@ elif mode == "Agents":
     ea = st.session_state.edit_agent
 
     if ea is None:
-        st.header("Agents")
+        mgr = get_manager()
+        c_hdr, c_close = st.columns([6, 2])
+        with c_hdr:
+            st.header("Agents")
+        with c_close:
+            if mgr and mgr.alive:
+                st.markdown("")
+                if st.button("Close Browser", use_container_width=True):
+                    close_browser(); st.rerun()
         if not agents_cfg:
             st.info("No agents yet — click **＋ New Agent** in the sidebar.")
 

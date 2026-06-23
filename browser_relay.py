@@ -1,9 +1,8 @@
 """
 browser_relay.py — Playwright browser automation for Relay.
 
-Each browser agent runs in its own dedicated worker thread because
-Playwright's sync API is not thread-safe. The worker owns the browser
-for its lifetime and accepts commands via queues.
+One shared browser context (one window), one tab per agent.
+All Playwright calls happen on a single dedicated thread.
 """
 import queue
 import threading
@@ -12,12 +11,12 @@ from pathlib import Path
 from typing import Optional
 
 PROFILES_DIR = Path(__file__).parent / "browser_profiles"
+SHARED_PROFILE = PROFILES_DIR / "_shared"
 
 SITES: dict[str, dict] = {
     "chatgpt": {
         "url":          "https://chatgpt.com",
         "url_match":    "chatgpt.com",
-        "new_chat":     "https://chatgpt.com/",
         "input":        [
             "#prompt-textarea",
             'div[contenteditable="true"][data-virtualkeyboard]',
@@ -29,7 +28,6 @@ SITES: dict[str, dict] = {
     "claude": {
         "url":          "https://claude.ai",
         "url_match":    "claude.ai",
-        "new_chat":     "https://claude.ai/new",
         "input":        [
             'div[contenteditable="true"].ProseMirror',
             ".ProseMirror",
@@ -46,7 +44,6 @@ SITES: dict[str, dict] = {
     "gemini": {
         "url":          "https://gemini.google.com",
         "url_match":    "gemini.google.com",
-        "new_chat":     "https://gemini.google.com/app",
         "input":        [
             'rich-textarea div[contenteditable="true"]',
             'div[contenteditable="true"][aria-label]',
@@ -62,7 +59,6 @@ SITES: dict[str, dict] = {
     "perplexity": {
         "url":          "https://www.perplexity.ai",
         "url_match":    "perplexity.ai",
-        "new_chat":     "https://www.perplexity.ai/",
         "input":        [
             'textarea[placeholder*="Ask"]',
             'textarea[placeholder]',
@@ -79,32 +75,18 @@ SITES: dict[str, dict] = {
     "grok": {
         "url":          "https://grok.com",
         "url_match":    "grok.com",
-        "new_chat":     "https://grok.com/",
-        "input":        [
-            'textarea[placeholder]',
-            'div[contenteditable="true"]',
-        ],
+        "input":        ['textarea[placeholder]', 'div[contenteditable="true"]'],
         "stop_btn":     None,
         "send_btn":     None,
-        "response_sel": [
-            ".message-content",
-            "[class*='response']",
-        ],
+        "response_sel": [".message-content", "[class*='response']"],
     },
     "copilot": {
         "url":          "https://copilot.microsoft.com",
         "url_match":    "copilot.microsoft.com",
-        "new_chat":     "https://copilot.microsoft.com/",
-        "input":        [
-            'textarea[placeholder]',
-            'div[contenteditable="true"]',
-        ],
+        "input":        ['textarea[placeholder]', 'div[contenteditable="true"]'],
         "stop_btn":     None,
         "send_btn":     None,
-        "response_sel": [
-            ".response-message",
-            "[class*='response']",
-        ],
+        "response_sel": [".response-message", "[class*='response']"],
     },
 }
 
@@ -117,8 +99,9 @@ def site_for_agent(agent_name: str) -> Optional[dict]:
     return None
 
 
-def _resolve_selector(page, selectors, timeout: int = 8000) -> Optional[object]:
-    """Try a list of selectors, return the first locator that finds an element."""
+# ── Page helpers ───────────────────────────────────────────────────────────────
+
+def _resolve_selector(page, selectors, timeout: int = 8000):
     if isinstance(selectors, str):
         selectors = [selectors]
     for sel in selectors:
@@ -133,29 +116,22 @@ def _resolve_selector(page, selectors, timeout: int = 8000) -> Optional[object]:
 
 
 def _type_and_submit(page, site: dict, message: str) -> None:
-    """Type message into the chat input and submit."""
     loc = _resolve_selector(page, site["input"])
     if loc is None:
         raise RuntimeError(
             f"Input box not found (tried: {site['input']}). "
             "Is the page loaded and are you logged in?"
         )
-
     el = loc.last
     el.click()
     time.sleep(0.1)
-
-    # Clear existing text
     el.press("Control+a")
     time.sleep(0.05)
     el.press("Delete")
     time.sleep(0.1)
-
-    # Type the message
     el.type(message, delay=15)
     time.sleep(0.2)
 
-    # Submit: try send button first, fall back to Enter
     send_sel = site.get("send_btn")
     submitted = False
     if send_sel:
@@ -171,11 +147,8 @@ def _type_and_submit(page, site: dict, message: str) -> None:
 
 
 def _wait_and_read(page, site: dict, timeout: int) -> str:
-    """Wait for the AI to finish responding, return the last response text."""
     stop_sel = site.get("stop_btn")
-
     if stop_sel:
-        # Wait for the stop button to appear (generation started)
         appeared = False
         for _ in range(20):
             try:
@@ -184,35 +157,22 @@ def _wait_and_read(page, site: dict, timeout: int) -> str:
                 break
             except Exception:
                 time.sleep(0.5)
-
         if appeared:
-            # Wait for it to disappear (generation done)
             try:
-                page.wait_for_selector(stop_sel, state="hidden",
-                                       timeout=timeout * 1000)
+                page.wait_for_selector(stop_sel, state="hidden", timeout=timeout * 1000)
             except Exception:
-                pass  # timed out — grab what's there
+                pass
         else:
-            # Stop button never appeared; maybe it responded instantly
             time.sleep(3)
     else:
-        # No stop button — poll for stable content
         _wait_stable(page, site, timeout)
-
     return _read_last_response(page, site)
 
 
 def _wait_stable(page, site: dict, timeout: int) -> None:
-    """For sites without a stop button, wait until response text stops changing."""
-    resp_sels = site["response_sel"]
-    if isinstance(resp_sels, str):
-        resp_sels = [resp_sels]
-
     deadline = time.time() + timeout
-    prev = ""
-    stable_count = 0
+    prev, stable_count = "", 0
     time.sleep(2)
-
     while time.time() < deadline:
         current = _read_last_response(page, site)
         if current and current == prev:
@@ -226,11 +186,9 @@ def _wait_stable(page, site: dict, timeout: int) -> None:
 
 
 def _read_last_response(page, site: dict) -> str:
-    """Read the last assistant response from the page."""
     resp_sels = site["response_sel"]
     if isinstance(resp_sels, str):
         resp_sels = [resp_sels]
-
     for sel in resp_sels:
         try:
             elements = page.locator(sel).all()
@@ -241,136 +199,157 @@ def _read_last_response(page, site: dict) -> str:
     return "[No response text found — check the browser window]"
 
 
-class BrowserWorker:
+# ── BrowserManager — one window, tabs per agent ────────────────────────────────
+
+class BrowserManager:
     """
-    Owns a single Playwright persistent browser context in a dedicated thread.
-    The thread is the only one that ever touches Playwright objects.
+    Single Playwright persistent context (one browser window).
+    Each agent gets its own tab. All Playwright calls stay on one thread.
     """
 
-    def __init__(self, agent_name: str):
-        self.agent_name = agent_name
-        self._cmd_q    = queue.Queue()
-        self._res_q    = queue.Queue()
-        self._alive    = threading.Event()
-        self._thread   = threading.Thread(
-            target=self._run, daemon=True, name=f"browser-{agent_name}"
-        )
+    def __init__(self):
+        self._cmd_q  = queue.Queue()
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="browser-manager")
+        self._pages: dict[str, object] = {}
         self._thread.start()
-        # Block until browser is open (or error/timeout)
+        # Wait for browser to open
         try:
-            status, val = self._res_q.get(timeout=60)
+            status, val = self._cmd_q.join_result = None, None
+            init_q = queue.Queue()
+            self._init_q = init_q
+            status, val = init_q.get(timeout=60)
         except queue.Empty:
             raise RuntimeError(
-                f"Browser for '{agent_name}' did not start within 60 s. "
-                "Check that Playwright is installed: python -m playwright install chromium"
+                "Browser did not open within 60 s. "
+                "Run: python -m playwright install chromium"
             )
         if status == "error":
             raise RuntimeError(val)
 
-    # ── Internal thread ────────────────────────────────────────────────────────
-
     def _run(self):
-        profile = PROFILES_DIR / self.agent_name
-        profile.mkdir(parents=True, exist_ok=True)
-        site = site_for_agent(self.agent_name)
-
         try:
             from playwright.sync_api import sync_playwright
+            SHARED_PROFILE.mkdir(parents=True, exist_ok=True)
             with sync_playwright() as pw:
                 ctx = pw.chromium.launch_persistent_context(
-                    str(profile),
+                    str(SHARED_PROFILE),
                     headless=False,
                     viewport={"width": 1280, "height": 900},
                     args=["--disable-blink-features=AutomationControlled"],
                 )
-                page = ctx.pages[0] if ctx.pages else ctx.new_page()
-                if site and site["url_match"] not in page.url:
-                    page.goto(site["url"], wait_until="domcontentloaded", timeout=30_000)
-
-                self._alive.set()
-                self._res_q.put(("ok", None))
+                # Signal ready
+                self._init_q.put(("ok", None))
 
                 while True:
                     try:
                         cmd = self._cmd_q.get(timeout=1)
                     except queue.Empty:
-                        # Heartbeat: check the page is still alive
+                        # Heartbeat — check context still alive
                         try:
-                            page.title()
+                            _ = ctx.pages
                         except Exception:
-                            # Page/context closed externally
-                            self._res_q.put(("error", "Browser window was closed"))
                             return
                         continue
 
                     if cmd is None:
+                        ctx.close()
                         break
 
-                    action, payload = cmd
+                    action, agent, payload, res_q = cmd
                     try:
-                        if action == "send":
+                        if action == "open":
+                            site = site_for_agent(agent)
+                            # Reuse existing tab if the agent already has one open
+                            page = self._pages.get(agent)
+                            if page is None or page.is_closed():
+                                page = ctx.new_page()
+                                self._pages[agent] = page
+                            if site and site["url_match"] not in page.url:
+                                page.goto(site["url"], wait_until="domcontentloaded",
+                                          timeout=30_000)
+                            # Bring tab to front
+                            page.bring_to_front()
+                            res_q.put(("ok", None))
+
+                        elif action == "send":
+                            page = self._pages.get(agent)
+                            if page is None or page.is_closed():
+                                raise RuntimeError(f"No open tab for '{agent}'")
+                            site = site_for_agent(agent)
+                            if site is None:
+                                raise RuntimeError(f"Unknown site for agent '{agent}'")
                             msg, timeout = payload
+                            page.bring_to_front()
                             _type_and_submit(page, site, msg)
                             reply = _wait_and_read(page, site, timeout)
-                            self._res_q.put(("ok", reply))
+                            res_q.put(("ok", reply))
+
+                        elif action == "close":
+                            page = self._pages.pop(agent, None)
+                            if page and not page.is_closed():
+                                page.close()
+                            res_q.put(("ok", None))
 
                         elif action == "status":
-                            self._res_q.put(("ok", {
-                                "url":   page.url,
-                                "title": page.title(),
-                            }))
+                            page = self._pages.get(agent)
+                            if page and not page.is_closed():
+                                res_q.put(("ok", {"url": page.url, "title": page.title()}))
+                            else:
+                                res_q.put(("ok", {}))
 
-                        elif action == "new_chat":
-                            url = site.get("new_chat", site["url"]) if site else None
-                            if url:
-                                page.goto(url, wait_until="domcontentloaded",
-                                          timeout=15_000)
-                            self._res_q.put(("ok", None))
+                        elif action == "list":
+                            res_q.put(("ok", list(self._pages.keys())))
 
                     except Exception as e:
-                        self._res_q.put(("error", str(e)))
+                        res_q.put(("error", str(e)))
 
         except Exception as e:
-            self._res_q.put(("error", str(e)))
-        finally:
-            self._alive.clear()
+            try:
+                self._init_q.put(("error", str(e)))
+            except Exception:
+                pass
 
-    # ── Public API (called from Streamlit thread) ──────────────────────────────
-
-    def send_message(self, message: str, timeout: int = 120) -> str:
-        """Send a message and block until the AI finishes responding."""
-        if not self.alive:
-            raise RuntimeError("Browser worker is not running")
-        self._cmd_q.put(("send", (message, timeout)))
+    def _call(self, action: str, agent: str, payload=None, timeout: int = 30):
+        res_q = queue.Queue()
+        self._cmd_q.put((action, agent, payload, res_q))
         try:
-            status, val = self._res_q.get(timeout=timeout + 30)
+            status, val = res_q.get(timeout=timeout)
         except queue.Empty:
-            raise RuntimeError(f"No response after {timeout + 30}s — check the browser window")
+            raise RuntimeError(f"Browser manager timed out on '{action}' for '{agent}'")
         if status == "error":
             raise RuntimeError(val)
         return val
 
-    def new_chat(self) -> None:
-        """Navigate to a fresh conversation."""
-        self._cmd_q.put(("new_chat", None))
-        try:
-            self._res_q.get(timeout=20)
-        except queue.Empty:
-            pass
+    def open(self, agent_name: str) -> None:
+        """Open a new tab for this agent and navigate to its site."""
+        self._call("open", agent_name, timeout=40)
 
-    def status(self) -> dict:
-        """Get current page URL and title."""
-        if not self.alive:
-            return {}
-        self._cmd_q.put(("status", None))
+    def send_message(self, agent_name: str, message: str, timeout: int = 120) -> str:
+        """Send a message in the agent's tab, wait for response."""
+        return self._call("send", agent_name, (message, timeout), timeout=timeout + 30)
+
+    def close_agent(self, agent_name: str) -> None:
+        """Close this agent's tab."""
+        self._call("close", agent_name, timeout=10)
+
+    def status(self, agent_name: str) -> dict:
+        """Return current URL + title for the agent's tab."""
         try:
-            _, val = self._res_q.get(timeout=5)
-            return val or {}
+            return self._call("status", agent_name, timeout=5) or {}
         except Exception:
             return {}
 
+    def has_agent(self, agent_name: str) -> bool:
+        """True if this agent has an open, non-closed tab."""
+        try:
+            s = self.status(agent_name)
+            return bool(s)
+        except Exception:
+            return False
+
     def close(self) -> None:
-        """Shut down the browser and worker thread."""
+        """Shut down the entire browser."""
         self._cmd_q.put(None)
         self._thread.join(timeout=10)
 
