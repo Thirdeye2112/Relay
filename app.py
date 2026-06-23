@@ -20,12 +20,16 @@ try:
     BrowserManager  = _br_mod.BrowserManager
     site_for_agent  = _br_mod.site_for_agent
     SITES           = _br_mod.SITES
+    profile_exists  = _br_mod.profile_exists
+    reset_profile   = _br_mod.reset_profile
     PLAYWRIGHT_AVAILABLE = True
     PLAYWRIGHT_ERROR = None
 except Exception as _pw_err:
     PLAYWRIGHT_AVAILABLE = False
     PLAYWRIGHT_ERROR = str(_pw_err)
     def site_for_agent(name): return None  # noqa: E704
+    def profile_exists(name): return False  # noqa: E704
+    def reset_profile(name): pass  # noqa: E704
     SITES = {}
 
 try:
@@ -545,7 +549,6 @@ elif mode == "Agents":
 
             # Reset login button (only for browser agents with a saved profile)
             if is_browser and PLAYWRIGHT_AVAILABLE:
-                from browser_relay import profile_exists, reset_profile
                 if profile_exists(name):
                     if st.button(f"↺ Reset login for {name.upper()}",
                                  key=f"reset_{name}", use_container_width=True):
