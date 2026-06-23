@@ -160,7 +160,29 @@ def _type_and_submit(page, site: dict, message: str) -> None:
         except Exception:
             pass
     if not submitted:
-        el.press("Enter")
+        # JS fallback: find a submit/send button without relying on a specific selector
+        try:
+            clicked = page.evaluate("""() => {
+                const labels = ['submit','send','ask'];
+                for (const b of document.querySelectorAll('button')) {
+                    const lbl = (b.getAttribute('aria-label') || b.textContent || '').toLowerCase();
+                    if (labels.some(l => lbl.includes(l)) && !b.disabled) {
+                        b.click(); return true;
+                    }
+                }
+                return false;
+            }""")
+            if clicked:
+                submitted = True
+        except Exception:
+            pass
+    if not submitted:
+        # Last resort: Enter (works for most chat inputs, Ctrl+Enter for textareas)
+        tag = el.evaluate("el => el.tagName.toLowerCase()")
+        if tag == "textarea":
+            el.press("Control+Return")
+        else:
+            el.press("Enter")
 
 
 def _wait_and_read(page, site: dict, timeout: int) -> str:
@@ -180,7 +202,9 @@ def _wait_and_read(page, site: dict, timeout: int) -> str:
             except Exception:
                 pass
         else:
-            time.sleep(3)
+            # Stop button never appeared (selector may be outdated) —
+            # fall back to stable-text polling so we actually wait for the response.
+            _wait_stable(page, site, timeout)
     else:
         _wait_stable(page, site, timeout)
     return _read_last_response(page, site)
@@ -210,10 +234,37 @@ def _read_last_response(page, site: dict) -> str:
         try:
             elements = page.locator(sel).all()
             if elements:
-                return elements[-1].inner_text().strip()
+                text = elements[-1].inner_text().strip()
+                if text and len(text) > 20:
+                    return text
         except Exception:
             continue
-    return "[No response text found — check the browser window]"
+    # JS fallback: scan the page for the last substantial text block.
+    # Covers sites where the CSS selectors have drifted.
+    try:
+        result = page.evaluate("""() => {
+            const candidates = [
+                '[data-testid*="message"]:not([data-testid*="input"])',
+                '[class*="message"]:not([class*="input"])',
+                '[class*="response"]',
+                '[class*="answer"]',
+                '[class*="prose"]',
+                'article',
+            ];
+            for (const sel of candidates) {
+                const els = [...document.querySelectorAll(sel)];
+                for (let i = els.length - 1; i >= 0; i--) {
+                    const t = els[i].innerText?.trim();
+                    if (t && t.length > 80) return t;
+                }
+            }
+            return null;
+        }""")
+        if result:
+            return result
+    except Exception:
+        pass
+    return "[No response captured — check the browser window]"
 
 
 # ── BrowserManager ──────────────────────────────────────────────────────────────
