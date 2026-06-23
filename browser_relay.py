@@ -288,6 +288,15 @@ class BrowserManager:
         else:
             res_q.put(("error", f"Tab index {page_index} out of range"))
 
+    def _arm_auto_resume(self, page) -> None:
+        """Auto-resume any debugger pause on this page (handles anti-bot debugger; statements)."""
+        try:
+            cdp = page.context.new_cdp_session(page)
+            cdp.send("Debugger.enable")
+            cdp.on("Debugger.paused", lambda _: cdp.send("Debugger.resume"))
+        except Exception:
+            pass
+
     def _do_open_tab(self, agent: str, res_q):
         site = site_for_agent(agent)
         if not site:
@@ -296,6 +305,7 @@ class BrowserManager:
         try:
             ctx = self._browser.contexts[0]
             page = ctx.new_page()
+            self._arm_auto_resume(page)
             page.goto(site["url"], wait_until="domcontentloaded", timeout=30_000)
             self._pages[agent] = page
             res_q.put(("ok", None))

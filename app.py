@@ -583,12 +583,20 @@ elif mode == "Agents":
                             if st.button("Unassign", key=f"ua_{name}", use_container_width=True):
                                 mgr.unassign(name); st.rerun()
                         else:
-                            if st.button("Open Tab", key=f"ot_{name}", use_container_width=True):
-                                with st.spinner(f"Opening {name.upper()}…"):
-                                    try:
-                                        mgr.open_tab(name); st.rerun()
-                                    except Exception as e:
-                                        st.session_state[f"tab_err_{name}"] = str(e); st.rerun()
+                            # Two options: find an already-open tab, or open a new one
+                            bc1, bc2 = st.columns(2)
+                            with bc1:
+                                if st.button("Find Tab", key=f"ft_{name}", use_container_width=True,
+                                             help="Assign an already-open tab for this agent"):
+                                    auto_assign_tabs(mgr); st.rerun()
+                            with bc2:
+                                if st.button("Open Tab", key=f"ot_{name}", use_container_width=True,
+                                             help="Open a new tab in Chrome for this agent"):
+                                    with st.spinner(f"Opening {name.upper()}…"):
+                                        try:
+                                            mgr.open_tab(name); st.rerun()
+                                        except Exception as e:
+                                            st.session_state[f"tab_err_{name}"] = str(e); st.rerun()
                             err = st.session_state.pop(f"tab_err_{name}", None)
                             if err:
                                 st.error(err)
