@@ -185,11 +185,27 @@ def _type_and_submit(page, site: dict, message: str) -> None:
             el.press("Enter")
 
 
-def _wait_and_read(page, site: dict, timeout: int) -> str:
+def _page_text(page) -> str:
+    try:
+        return page.evaluate("() => document.body.innerText") or ""
+    except Exception:
+        return ""
+
+
+def _wait_and_read(page, site: dict, timeout: int, pre_len: int = 0) -> str:
+    """Wait for the AI response then return it.
+
+    Strategy:
+    1. Try the site's stop-button selector to detect generation start/end.
+    2. If the selector doesn't match, fall back to watching page-text grow
+       and stabilise — selector-agnostic, works even when DOM class names drift.
+    3. Extract response: try CSS selectors first, then return the page-text diff
+       (everything that appeared after pre_len) as an unambiguous fallback.
+    """
     stop_sel = site.get("stop_btn")
+    appeared = False
     if stop_sel:
-        appeared = False
-        for _ in range(20):
+        for _ in range(30):
             try:
                 page.wait_for_selector(stop_sel, timeout=1000)
                 appeared = True
@@ -201,33 +217,44 @@ def _wait_and_read(page, site: dict, timeout: int) -> str:
                 page.wait_for_selector(stop_sel, state="hidden", timeout=timeout * 1000)
             except Exception:
                 pass
-        else:
-            # Stop button never appeared (selector may be outdated) —
-            # fall back to stable-text polling so we actually wait for the response.
-            _wait_stable(page, site, timeout)
-    else:
-        _wait_stable(page, site, timeout)
-    return _read_last_response(page, site)
 
+    if not appeared:
+        # Selector-agnostic wait: poll body.innerText length until stable
+        deadline = time.time() + timeout
+        time.sleep(2)
+        prev_len = len(_page_text(page))
+        stable = 0
+        while time.time() < deadline:
+            cur_len = len(_page_text(page))
+            if cur_len == prev_len and cur_len > pre_len + 80:
+                stable += 1
+                if stable >= 3:
+                    break
+            elif cur_len != prev_len:
+                stable = 0
+            prev_len = cur_len
+            time.sleep(1)
 
-def _wait_stable(page, site: dict, timeout: int) -> None:
-    deadline = time.time() + timeout
-    prev, stable_count = "", 0
-    time.sleep(2)
-    while time.time() < deadline:
-        current = _read_last_response(page, site)
-        if current and current == prev:
-            stable_count += 1
-            if stable_count >= 3:
-                return
-        else:
-            stable_count = 0
-        prev = current
-        time.sleep(1)
+    # --- Extract the response text ---
+
+    # 1. Try specific CSS selectors (fast, precise when selectors are current)
+    resp = _read_last_response(page, site)
+    if resp and len(resp) > 50:
+        return resp
+
+    # 2. Page-text diff: return everything new since before we typed.
+    #    Includes the echoed user message at the top, but that's acceptable.
+    if pre_len > 0:
+        full = _page_text(page)
+        new_text = full[pre_len:].strip()
+        if len(new_text) > 50:
+            return new_text
+
+    return "[No response captured — check the browser window]"
 
 
 def _read_last_response(page, site: dict) -> str:
-    resp_sels = site["response_sel"]
+    resp_sels = site.get("response_sel", [])
     if isinstance(resp_sels, str):
         resp_sels = [resp_sels]
     for sel in resp_sels:
@@ -239,32 +266,7 @@ def _read_last_response(page, site: dict) -> str:
                     return text
         except Exception:
             continue
-    # JS fallback: scan the page for the last substantial text block.
-    # Covers sites where the CSS selectors have drifted.
-    try:
-        result = page.evaluate("""() => {
-            const candidates = [
-                '[data-testid*="message"]:not([data-testid*="input"])',
-                '[class*="message"]:not([class*="input"])',
-                '[class*="response"]',
-                '[class*="answer"]',
-                '[class*="prose"]',
-                'article',
-            ];
-            for (const sel of candidates) {
-                const els = [...document.querySelectorAll(sel)];
-                for (let i = els.length - 1; i >= 0; i--) {
-                    const t = els[i].innerText?.trim();
-                    if (t && t.length > 80) return t;
-                }
-            }
-            return null;
-        }""")
-        if result:
-            return result
-    except Exception:
-        pass
-    return "[No response captured — check the browser window]"
+    return ""
 
 
 # ── BrowserManager ──────────────────────────────────────────────────────────────
@@ -409,8 +411,9 @@ class BrowserManager:
             return
         msg, timeout = payload
         page.bring_to_front()
+        pre_len = len(_page_text(page))   # snapshot before typing
         _type_and_submit(page, site, msg)
-        reply = _wait_and_read(page, site, timeout)
+        reply = _wait_and_read(page, site, timeout, pre_len)
         res_q.put(("ok", reply))
 
     # ── Public API ────────────────────────────────────────────────────────────
