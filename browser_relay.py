@@ -352,9 +352,21 @@ class BrowserManager:
                 viewport={"width": 1280, "height": 900},
                 args=["--disable-blink-features=AutomationControlled"],
             )
+            # Suppress navigator.webdriver and disable the JS debugger so
+            # anti-bot `debugger;` statements don't pause the browser.
+            ctx.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
+            )
             self._contexts[agent] = ctx
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             self._pages[agent] = page
+
+            # Disable CDP debugger on the page so `debugger;` is a no-op
+            try:
+                cdp = ctx.new_cdp_session(page)
+                cdp.send("Debugger.disable")
+            except Exception:
+                pass
 
             site = site_for_agent(agent)
             if site and site["url_match"] not in page.url:
