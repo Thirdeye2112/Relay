@@ -9,6 +9,7 @@ import os
 import queue
 import shutil
 import stat
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -230,6 +231,21 @@ def _read_last_response(page, site: dict) -> str:
     return "[No response text found — check the browser window]"
 
 
+def _kill_chrome_using_profile(profile_dir: str) -> None:
+    """Kill any Chrome/Chromium process holding a lock on this profile directory."""
+    try:
+        subprocess.run([
+            "powershell", "-NoProfile", "-Command",
+            f"Get-CimInstance Win32_Process -Filter \"name='chrome.exe'\" | "
+            f"Where-Object {{$_.CommandLine -like '*{profile_dir}*'}} | "
+            f"ForEach-Object {{Stop-Process -Id $_.ProcessId -Force "
+            f"-ErrorAction SilentlyContinue}}",
+        ], capture_output=True, timeout=8)
+        time.sleep(0.8)  # give Windows time to release file handles
+    except Exception:
+        pass
+
+
 # ── BrowserManager ─────────────────────────────────────────────────────────────
 
 class BrowserManager:
@@ -315,7 +331,7 @@ class BrowserManager:
         self._pages.clear()
 
     def _do_open(self, agent: str, res_q):
-        # Close stale context for this agent if present
+        # Close stale Playwright context for this agent if present
         if agent in self._contexts:
             try:
                 self._contexts[agent].pages  # probe
@@ -326,6 +342,10 @@ class BrowserManager:
         if agent not in self._contexts:
             profile = PROFILES_DIR / agent
             profile.mkdir(parents=True, exist_ok=True)
+
+            # Kill any Chrome process still holding this profile (exit code 21 guard)
+            _kill_chrome_using_profile(str(profile))
+
             ctx = self._pw.chromium.launch_persistent_context(
                 str(profile),
                 headless=False,
