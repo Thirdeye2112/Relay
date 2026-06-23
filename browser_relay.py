@@ -21,14 +21,17 @@ SITES: dict[str, dict] = {
         "url":          "https://claude.ai/new",
         "url_match":    "claude.ai",
         "input":        [
+            '[data-testid="chat-input"]',
             'div[contenteditable="true"].ProseMirror',
             ".ProseMirror",
             'div[contenteditable="true"]',
         ],
-        "stop_btn":     'button[aria-label="Stop"]',
-        "send_btn":     'button[aria-label="Send message"]',
+        "stop_btn":     '[aria-label="Stop"]',
+        "send_btn":     '[data-testid="send-button"]',
         "response_sel": [
+            '[data-testid="assistant-message"]',
             ".font-claude-message",
+            '[class*="claude-message"]',
             '[data-is-streaming="false"] .prose',
             ".prose",
         ],
@@ -123,15 +126,26 @@ def _type_and_submit(page, site: dict, message: str) -> None:
         )
     el = loc.last
     el.click()
-    # execCommand('insertText') inserts the full text at once.
-    # Works with ProseMirror/rich-text editors; fill() does not trigger
-    # their internal state updates and type() times out on long messages.
-    page.evaluate(
-        "text => { document.execCommand('selectAll'); "
-        "document.execCommand('insertText', false, text); }",
-        message,
-    )
-    # Wait for the editor to fully register the input before submitting.
+    # Choose insertion method based on element type:
+    # - textarea/input: fill() works natively and triggers React state
+    # - contenteditable (ProseMirror etc): execCommand('insertText') is needed
+    tag = el.evaluate("el => el.tagName.toLowerCase()")
+    if tag in ("textarea", "input"):
+        el.fill(message)
+        # Trigger React's synthetic events so the send button activates
+        page.evaluate(
+            "sel => { const el = document.querySelector(sel); "
+            "if (el) { el.dispatchEvent(new Event('input', {bubbles:true})); "
+            "el.dispatchEvent(new Event('change', {bubbles:true})); } }",
+            site["input"][0] if isinstance(site["input"], list) else site["input"],
+        )
+    else:
+        page.evaluate(
+            "text => { document.execCommand('selectAll'); "
+            "document.execCommand('insertText', false, text); }",
+            message,
+        )
+    # Wait for the editor to register the full input before submitting.
     time.sleep(0.8)
 
     submitted = False
@@ -139,7 +153,6 @@ def _type_and_submit(page, site: dict, message: str) -> None:
     if send_sel:
         try:
             btn = page.locator(send_sel)
-            # Wait up to 3s for the send button to become enabled after input
             btn.first.wait_for(state="visible", timeout=3000)
             if btn.count() > 0 and btn.first.is_enabled():
                 btn.first.click()
