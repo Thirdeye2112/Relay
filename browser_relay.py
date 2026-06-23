@@ -392,10 +392,11 @@ class BrowserManager:
 
                     action, agent, payload, res_q = cmd
                     try:
-                        if   action == "scan":     self._do_scan(res_q)
-                        elif action == "assign":   self._do_assign(agent, payload, res_q)
-                        elif action == "open_tab": self._do_open_tab(agent, res_q)
-                        elif action == "send":     self._do_send(agent, payload, res_q)
+                        if   action == "scan":       self._do_scan(res_q)
+                        elif action == "assign":     self._do_assign(agent, payload, res_q)
+                        elif action == "open_tab":   self._do_open_tab(agent, res_q)
+                        elif action == "send":       self._do_send(agent, payload, res_q)
+                        elif action == "send_batch": self._do_send_batch(payload, res_q)
                         elif action == "unassign":
                             self._pages.pop(agent, None)
                             res_q.put(("ok", None))
@@ -484,6 +485,101 @@ class BrowserManager:
         reply = _wait_and_read(page, site, timeout, pre_len, pre_counts, agent)
         res_q.put(("ok", reply))
 
+    def _do_send_batch(self, payloads: dict, res_q):
+        """Submit to all agents sequentially (fast), then poll all round-robin.
+
+        payloads: {agent_name: (message_str, timeout_seconds)}
+        Returns:  {agent_name: reply_str}  — errors embedded as "[Error: …]" strings.
+
+        Wall-clock time ≈ slowest individual response, not the sum.
+        All Playwright calls stay on this single thread — no thread-safety risk.
+        """
+        # Step 1: type + submit to every agent in turn (~1-2s each)
+        state = {}
+        for ag, (msg, tout) in payloads.items():
+            page = self._pages.get(ag)
+            site = site_for_agent(ag)
+            if page is None or page.is_closed() or site is None:
+                state[ag] = {"error": "No tab assigned or unknown site"}
+                continue
+            try:
+                page.bring_to_front()
+                pre_len    = len(_page_text(page))
+                pre_counts = _response_counts(page, site)
+                _type_and_submit(page, site, msg, ag)
+                state[ag] = {
+                    "page": page, "site": site,
+                    "pre_len": pre_len, "pre_counts": pre_counts,
+                    "prev_len": pre_len,
+                    "deadline": time.time() + tout,
+                    "stable": 0, "stop_seen": False, "new_el_seen": False,
+                }
+            except Exception as e:
+                state[ag] = {"error": str(e)}
+
+        results = {a: f"[Error: {s['error']}]" for a, s in state.items() if "error" in s}
+        pending  = [a for a in state if "error" not in state[a]]
+
+        # Step 2: round-robin poll until every agent has replied
+        time.sleep(2)
+        while pending:
+            still = []
+            for ag in pending:
+                s = state[ag]
+                page, site = s["page"], s["site"]
+
+                if time.time() > s["deadline"]:
+                    cur = _page_text(page)
+                    results[ag] = cur[s["pre_len"]:].strip() or "[Timed out]"
+                    continue
+
+                # Stop-button detection (fastest signal when selector is current)
+                stop_sel  = site.get("stop_btn")
+                stop_now  = False
+                if stop_sel:
+                    try:
+                        stop_now = page.locator(stop_sel).count() > 0
+                    except Exception:
+                        pass
+                    if stop_now:
+                        s["stop_seen"] = True
+                    if s["stop_seen"] and not stop_now:
+                        resp = _read_last_response(page, site)
+                        if not resp or len(resp) < 50:
+                            resp = _page_text(page)[s["pre_len"]:].strip()
+                        results[ag] = resp or "[No response captured]"
+                        continue
+
+                # Element-count gate: don't start stability check until a
+                # new response element actually appears in the DOM.
+                if not s["new_el_seen"]:
+                    cur_counts = _response_counts(page, site)
+                    if any(cur_counts.get(sel, 0) > n
+                           for sel, n in s["pre_counts"].items()):
+                        s["new_el_seen"] = True
+
+                # Stable-text fallback (works when stop-btn selector is stale)
+                cur_len = len(_page_text(page))
+                if s["new_el_seen"] and cur_len == s["prev_len"] and cur_len > s["pre_len"] + 80:
+                    s["stable"] += 1
+                    if s["stable"] >= 4:
+                        cur  = _page_text(page)
+                        resp = _read_last_response(page, site)
+                        if not resp or len(resp) < 50:
+                            resp = cur[s["pre_len"]:].strip()
+                        results[ag] = resp or "[No response captured]"
+                        continue
+                else:
+                    s["stable"] = 0
+                s["prev_len"] = cur_len
+                still.append(ag)
+
+            pending = still
+            if pending:
+                time.sleep(1)
+
+        res_q.put(("ok", results))
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     def _call(self, action: str, agent: str = "", payload=None, timeout: int = 40):
@@ -506,6 +602,16 @@ class BrowserManager:
 
     def send_message(self, agent: str, message: str, timeout: int = 120) -> str:
         return self._call("send", agent, (message, timeout), timeout=timeout + 30)
+
+    def send_batch(self, payloads: dict, timeout: int = 120) -> dict:
+        """Submit to all agents simultaneously and return {agent: reply}.
+
+        payloads: {agent_name: message_str}  (timeout shared across all).
+        Total wait ≈ slowest agent, not sum of all agents.
+        """
+        full_payloads = {a: (msg, timeout) for a, msg in payloads.items()}
+        max_wait = timeout + len(payloads) * 5 + 30
+        return self._call("send_batch", payload=full_payloads, timeout=max_wait)
 
     def has_agent(self, agent: str) -> bool:
         try:

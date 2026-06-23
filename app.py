@@ -314,41 +314,89 @@ def run_synthesis(sid: str, user_msg: str, replies: dict) -> None:
 
 # ── Group round ───────────────────────────────────────────────────────────────
 
+def _build_cross_context(sid: str, my_name: str, participants: dict) -> str:
+    """Return the last reply from every other participant, formatted for embedding."""
+    parts = []
+    for name in participants:
+        if name == my_name:
+            continue
+        history = load_session(sid, name)
+        last = next((m.content for m in reversed(history) if m.role == "assistant"), None)
+        if last:
+            parts.append(f"[{name.upper()}]: {last}")
+    if not parts:
+        return ""
+    return "The other panelists said:\n\n" + "\n\n".join(parts)
+
+
 def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = True) -> None:
     append_display(sid, {"type": "user", "content": user_msg})
     for name in participants:
         append_message(sid, name, Message("user", user_msg))
 
-    replies = {}
-    for name, cfg in participants.items():
+    replies: dict = {}
+
+    # ── Browser agents — submit all at once, wait in parallel ─────────────────
+    browser_agents = {n: c for n, c in participants.items()
+                      if getattr(c, "mode", "api") == "browser"}
+    api_agents     = {n: c for n, c in participants.items()
+                      if getattr(c, "mode", "api") != "browser"}
+
+    if browser_agents:
+        mgr = get_manager()
+        payloads: dict = {}
+        no_tab: list   = []
+
+        for name, cfg in browser_agents.items():
+            if not mgr or not mgr.has_agent(name):
+                no_tab.append(name)
+                continue
+            history  = load_session(sid, name)
+            is_first = not any(m.role == "user" for m in history)
+            if is_first:
+                msg_to_send = f"{cfg.system_prompt}\n\n---\n\n{user_msg}"
+            else:
+                cross = _build_cross_context(sid, name, participants)
+                msg_to_send = (f"{cross}\n\n---\n\nUser: {user_msg}"
+                               if cross else user_msg)
+            payloads[name] = msg_to_send
+
+        for name in no_tab:
+            with st.chat_message(name, avatar=avatar(name)):
+                st.error(f"{name.upper()} has no tab — assign one in Agents.")
+
+        if payloads and mgr:
+            agent_list = ", ".join(payloads.keys())
+            with st.spinner(f"Waiting for {agent_list}…"):
+                try:
+                    batch = mgr.send_batch(payloads)
+                    replies.update(batch)
+                except Exception as e:
+                    st.error(f"Batch send failed: {e}")
+
+        # Display results in agent order
+        for name in browser_agents:
+            if name not in replies:
+                continue
+            with st.chat_message(name, avatar=avatar(name)):
+                st.markdown(f"**{name.upper()}**")
+                st.markdown(replies[name])
+
+    # ── API agents — sequential with streaming ─────────────────────────────────
+    for name, cfg in api_agents.items():
         with st.chat_message(name, avatar=avatar(name)):
             st.markdown(f"**{name.upper()}**")
             try:
-                if getattr(cfg, "mode", "api") == "browser":
-                    mgr = get_manager()
-                    if not mgr or not mgr.has_agent(name):
-                        st.error(f"{name.upper()} has no tab — assign one in Agents.")
-                        continue
-                    # Prepend system prompt on the very first user message
-                    history = load_session(sid, name)
-                    is_first = not any(m.role == "user" for m in history)
-                    msg_to_send = (
-                        f"{cfg.system_prompt}\n\n---\n\n{user_msg}" if is_first else user_msg
-                    )
-                    with st.spinner(f"{name.upper()} responding…"):
-                        reply = mgr.send_message(name, msg_to_send)
-                    st.markdown(reply)
-                else:
-                    reply = st.write_stream(stream_agent(cfg, load_session(sid, name)))
+                reply = st.write_stream(stream_agent(cfg, load_session(sid, name)))
+                replies[name] = reply
             except Exception as e:
-                err_msg = str(e)
-                st.error(f"**{name.upper()} failed:** {err_msg}")
-                continue
-        replies[name] = reply
+                st.error(f"**{name.upper()} failed:** {e}")
+
+    # Persist replies + cross-inject for session history
+    for name, reply in replies.items():
         append_display(sid, {"type": "reply", "agent": name, "content": reply})
         append_message(sid, name, Message("assistant", reply))
 
-    # Cross-inject: each agent sees all other replies before the next round
     for name in participants:
         for other, reply in replies.items():
             if other != name:
@@ -362,7 +410,7 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
     if replies:
         repo = get_github_repo()
         if repo:
-            meta  = load_meta(sid)
+            meta = load_meta(sid)
             commit_async(_gh_append_round, repo, meta.get("topic", "conversation"),
                          list(participants.keys()), user_msg, replies)
 
@@ -538,7 +586,7 @@ elif mode == "Agents":
                             st.markdown("**🔴 Chrome disconnected**")
                     else:
                         st.markdown("**⚪ Chrome not connected**")
-                        st.caption(f"Launch Chrome with `--remote-debugging-port=9222`, log in to your AI accounts, then connect.")
+                        st.caption("Launch Chrome with Step 2 command in Settings → Chrome Setup. Sign in first with Step 1 (no debug port) so Google OAuth works.")
                 with cc2:
                     if mgr:
                         if st.button("Re-scan tabs", use_container_width=True):
@@ -707,7 +755,24 @@ else:
 
     st.subheader("Chrome Setup")
     with st.container(border=True):
-        st.markdown("**Run this command once to launch a Relay-dedicated Chrome window:**")
+        st.markdown("### Step 1 — Pre-authenticate (first time only)")
+        st.markdown(
+            "Launch Chrome **without** the debug port so Google OAuth runs in a clean browser "
+            "(Google detects and blocks sign-in inside a debug-mode window):"
+        )
+        st.code(
+            'Start-Process "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" '
+            '-ArgumentList "--user-data-dir=C:\\relay-chrome-profile"',
+            language="powershell",
+        )
+        st.markdown(
+            "In that window, sign into **claude.ai, chatgpt.com, gemini.google.com, perplexity.ai** normally. "
+            "Then close Chrome completely (all windows)."
+        )
+
+        st.divider()
+        st.markdown("### Step 2 — Launch for Relay (every session)")
+        st.markdown("Reopen Chrome with the debug port — same profile, so all logins are already there:")
         st.code(
             'Start-Process "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" '
             '-ArgumentList "--remote-debugging-port=9222","--remote-allow-origins=*","--user-data-dir=C:\\relay-chrome-profile"',
@@ -715,12 +780,11 @@ else:
         )
         st.markdown(
             "- Paste into **PowerShell** and press Enter\n"
-            "- A fresh Chrome window opens — log into claude.ai, chatgpt.com, etc.\n"
-            "- Go to **Agents** → **Connect to Chrome**\n"
-            "- Run this command each time you want to use Relay (logins persist)\n\n"
-            "**Verify:** open a new tab in that Chrome and go to `localhost:9222` — you should see a JSON page."
+            "- Sites should open already logged in — no re-auth needed\n"
+            "- Go to **Agents** → **Connect to Chrome** → **Find Tab** for each agent\n\n"
+            "> **If a Google session ever expires** while in debug mode, close Chrome, repeat Step 1 to re-auth, then Step 2 to relaunch."
         )
-        st.caption(f"Relay connects to: `{CDP_URL}`  ·  Profile saved at `C:\\relay-chrome-profile`")
+        st.caption(f"Relay connects to: `{CDP_URL}`  ·  Profile dir: `C:\\relay-chrome-profile`")
 
     st.subheader("API Keys")
     col1, col2 = st.columns(2)
