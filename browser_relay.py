@@ -363,19 +363,24 @@ class BrowserManager:
             self._pages[agent] = page
 
             # Navigate to blank first so any saved-session page stops loading.
-            # This guarantees our CDP command lands before any site JS runs.
             try:
                 page.goto("about:blank", wait_until="commit", timeout=5_000)
             except Exception:
                 pass
 
-            # Now send setSkipAllPauses — page is idle, no race condition.
-            try:
-                cdp = ctx.new_cdp_session(page)
-                cdp.send("Debugger.enable")
-                cdp.send("Debugger.setSkipAllPauses", {"skip": True})
-            except Exception:
-                pass
+            # Auto-resume any debugger pause — works regardless of timing.
+            # Listens for Debugger.paused events and immediately resumes,
+            # so anti-bot `debugger;` statements never freeze the browser.
+            def _auto_resume(p):
+                try:
+                    cdp = ctx.new_cdp_session(p)
+                    cdp.send("Debugger.enable")
+                    cdp.on("Debugger.paused", lambda _: cdp.send("Debugger.resume"))
+                except Exception:
+                    pass
+
+            _auto_resume(page)
+            ctx.on("page", _auto_resume)
 
             site = site_for_agent(agent)
             if site:
