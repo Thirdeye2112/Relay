@@ -291,6 +291,22 @@ def append_display(sid: str, event: dict) -> None:
     with open(p, "a", encoding="utf-8") as f:
         f.write(json.dumps(event) + "\n")
 
+DEBUG_DIR = Path(__file__).parent / "debug"
+
+def _dump_payloads_to_disk(payloads: dict) -> None:
+    """Write the exact outgoing string for every browser agent this round to
+    disk (debug/round_payload_*.txt) -- ground truth for whether cross-
+    injection actually produced real content, captured before send_batch
+    touches any tab (independent of anything the transport does afterward).
+    """
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    try:
+        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        for name, payload in payloads.items():
+            (DEBUG_DIR / f"round_payload_{name}_{stamp}.txt").write_text(payload, encoding="utf-8")
+    except Exception:
+        pass
+
 def render_display(sid: str) -> None:
     p = display_path(sid)
     if not p.exists():
@@ -309,6 +325,11 @@ def render_display(sid: str) -> None:
         elif ev["type"] == "synthesis":
             with st.chat_message("synthesis", avatar="🔮"):
                 st.markdown(f"**SYNTHESIS**\n\n{ev['content']}")
+        elif ev["type"] == "payload_dump":
+            with st.expander("🔍 Payloads sent this round"):
+                for name, payload in ev["payloads"].items():
+                    st.caption(name.upper())
+                    st.code(payload, language=None)
 
 # ── Synthesizer ───────────────────────────────────────────────────────────────
 
@@ -423,7 +444,7 @@ def _build_browser_msg(sid: str, name: str, cfg, active: dict, user_msg: str) ->
         # The separator line signals a hard context break so the model doesn't answer
         # whatever was previously in the window.
         return (
-            "=== NEW RELAY SESSION — START FRESH, IGNORE PRIOR MESSAGES IN THIS WINDOW ===\n\n"
+            "=== New relay session starting ===\n\n"
             f"{sys_msg}\n\n---\n\n{user_msg}"
         )
 
@@ -456,8 +477,18 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
     for name, cfg in browser_agents.items():
         payloads[name] = _build_browser_msg(sid, name, cfg, active, user_msg)
 
+    # Diagnostic dump: capture the EXACT string about to be typed into each
+    # tab, before send_batch touches the (possibly still-flaky) browser
+    # transport. Written to disk now (ground truth, before anything else
+    # runs); shown in the UI further below, after the user message, so the
+    # transcript reads in the order things actually happened.
+    if payloads:
+        _dump_payloads_to_disk(payloads)
+
     # Now commit the user turn to all agent histories and the display log.
     append_display(sid, {"type": "user", "content": user_msg})
+    if payloads:
+        append_display(sid, {"type": "payload_dump", "payloads": payloads})
     for name in active:
         append_message(sid, name, Message("user", user_msg))
 
