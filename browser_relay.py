@@ -116,7 +116,7 @@ def site_for_agent(agent_name: str) -> Optional[dict]:
 
 # ── Page helpers ────────────────────────────────────────────────────────────────
 
-def _resolve_selector(page, selectors, timeout: int = 8000):
+def _resolve_selector(page, selectors, timeout: int = 2000):
     """Resolve to a single, VISIBLE matching element.
 
     Hidden/decoy duplicates (legacy SEO textareas, off-screen mobile
@@ -124,6 +124,9 @@ def _resolve_selector(page, selectors, timeout: int = 8000):
     into it is indistinguishable from doing nothing, which is exactly
     what broke Perplexity's input. Returns the element itself (already
     resolved), not a multi-match Locator -- callers no longer need `.last`.
+
+    Per-selector timeout is 2 s (down from 8 s) so a full fallback chain of
+    five selectors stalls at most 10 s instead of 40 s.
     """
     if isinstance(selectors, str):
         selectors = [selectors]
@@ -180,7 +183,7 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
     time.sleep(0.1)   # let focus settle before detecting element type
     tag = el.evaluate("el => el.tagName.toLowerCase()")
     is_lexical = el.evaluate(
-        "el => el.hasAttribute('data-lexical-editor') || el.getAttribute('role') === 'textbox'"
+        "el => el.hasAttribute('data-lexical-editor')"
     )
 
     if tag in ("textarea", "input"):
@@ -211,14 +214,20 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
     submitted = False
     send_sel = site.get("send_btn")
     if send_sel:
-        try:
-            btn = page.locator(send_sel)
-            btn.first.wait_for(state="visible", timeout=3000)
-            if btn.count() > 0 and btn.first.is_enabled():
-                btn.first.click()
-                submitted = True
-        except Exception:
-            pass
+        # Retry for up to 5 s — large pastes keep the send button disabled while
+        # the editor parses the content; a single is_enabled() snap-check fires too early.
+        deadline = time.time() + 5.0
+        while time.time() < deadline and not submitted:
+            try:
+                btn = page.locator(send_sel)
+                if btn.count() > 0 and btn.first.is_visible() and btn.first.is_enabled():
+                    btn.first.click()
+                    submitted = True
+            except Exception:
+                pass
+            if not submitted:
+                time.sleep(0.2)
+
     if not submitted:
         # Find the submit button closest to the focused input, then fall back globally.
         try:
@@ -235,7 +244,9 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
                 const composer = active &&
                     (active.closest('form') ||
                      active.closest('[class*="composer"]') ||
-                     active.closest('[class*="input"]'));
+                     active.closest('[class*="input"]') ||
+                     active.closest('[data-testid*="composer"]') ||
+                     active.closest('[data-testid*="input"]'));
                 if (composer && tryClick(composer)) return true;
                 // 2. Labelled send/submit/ask buttons anywhere
                 const labels = ['submit','send','ask'];
@@ -328,6 +339,15 @@ def _wait_and_read(page, site: dict, timeout: int, pre_len: int = 0,
                 page.wait_for_selector(stop_sel, state="hidden", timeout=timeout * 1000)
             except Exception:
                 pass
+            # Stop button fired but selectors may still be stale — wait for a new
+            # response element before reading so we don't return the previous reply.
+            if pre_counts:
+                el_deadline = time.time() + 10
+                while time.time() < el_deadline:
+                    cur_counts = _response_counts(page, site)
+                    if any(cur_counts.get(sel, 0) > n for sel, n in pre_counts.items()):
+                        break
+                    time.sleep(0.5)
 
     if not appeared:
         deadline = time.time() + timeout
@@ -401,17 +421,16 @@ _UI_CHROME = [
 ]
 
 def _clean_diff(text: str) -> str:
-    """Strip UI chrome from a page-text diff and return the response content."""
+    """Strip UI chrome from a page-text diff and return the response content.
+
+    Uses exact whole-line matching (after strip/lower) so short common words
+    like "Copy" or "Share" only match standalone button-label lines, not prose
+    that happens to contain those words.
+    """
+    _chrome_exact = {p.lower() for p in _UI_CHROME}
     lines = text.splitlines()
-    clean = []
-    for line in lines:
-        stripped = line.strip()
-        if any(pat in stripped for pat in _UI_CHROME):
-            continue
-        clean.append(line)
-    # Drop leading/trailing blank lines and return
+    clean = [l for l in lines if l.strip().lower() not in _chrome_exact]
     result = "\n".join(clean).strip()
-    # If everything was stripped (very short response), return original
     return result if result else text.strip()
 
 

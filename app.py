@@ -176,6 +176,17 @@ def connect_browser() -> None:
     st.session_state.browser_manager = m
     auto_assign_tabs(m)
 
+def _tab_matches_site(tab: dict, site: dict) -> bool:
+    """True if the tab URL matches the site, with exclusions for site-specific edge cases."""
+    url = tab["url"]
+    if site["url_match"] not in url:
+        return False
+    # claude.ai/code is the Claude Code web IDE, not a chat tab — never assign it
+    # to chat agents even though it contains "claude.ai".
+    if site["key"] == "claude" and "claude.ai/code" in url:
+        return False
+    return True
+
 def auto_assign_tabs(m: "BrowserManager") -> None:
     """Scan open tabs and assign each browser agent to the first matching tab."""
     tabs = m.scan_tabs()
@@ -189,7 +200,7 @@ def auto_assign_tabs(m: "BrowserManager") -> None:
         if not site:
             continue
         for i, tab in enumerate(tabs):
-            if site["url_match"] in tab["url"] and i not in used:
+            if _tab_matches_site(tab, site) and i not in used:
                 try:
                     m.assign_tab(name, i)
                     used.add(i)
@@ -204,7 +215,7 @@ def find_tab_for_agent(m: "BrowserManager", agent_name: str) -> str | None:
     if not site:
         return None
     for i, tab in enumerate(tabs):
-        if site["url_match"] in tab["url"]:
+        if _tab_matches_site(tab, site):
             try:
                 m.assign_tab(agent_name, i)
                 return tab["url"]
@@ -362,7 +373,7 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
 
         for name, cfg in browser_agents.items():
             history  = load_session(sid, name)
-            is_first = not any(m.role == "user" for m in history)
+            is_first = not any(m.role == "assistant" for m in history)
             if is_first:
                 msg_to_send = f"{cfg.system_prompt}\n\n---\n\n{user_msg}"
             else:
@@ -399,12 +410,21 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
                 st.error(f"**{name.upper()} failed:** {e}")
 
     # Persist replies + cross-inject for session history
+    # Filter out error/sentinel values before cross-injection so one broken tab
+    # doesn't poison the other agents' context with fabricated "replies".
+    _SENTINEL_PREFIXES = ("[Error:", "[Timed out]", "[No response")
+    real_replies = {
+        n: r for n, r in replies.items()
+        if not any(r.startswith(p) for p in _SENTINEL_PREFIXES)
+    }
+
     for name, reply in replies.items():
         append_display(sid, {"type": "reply", "agent": name, "content": reply})
-        append_message(sid, name, Message("assistant", reply))
+        if name in real_replies:
+            append_message(sid, name, Message("assistant", reply))
 
     for name in active:
-        for other, reply in replies.items():
+        for other, reply in real_replies.items():
             if other != name:
                 append_message(sid, name, Message("user", f"[{other.upper()}]: {reply}"))
 
