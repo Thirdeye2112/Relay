@@ -30,11 +30,14 @@ SITES: dict[str, dict] = {
         "stop_btn":     '[aria-label="Stop"]',
         "send_btn":     '[data-testid="send-button"]',
         "response_sel": [
-            '[data-testid="assistant-message"]',
+            # Most specific first — target the prose body inside the assistant turn
+            '[data-testid="assistant-message"] .prose-sm',
+            '[data-testid="assistant-message"] .prose',
+            '[data-testid="assistant-message"] p',
+            ".font-claude-message .prose",
             ".font-claude-message",
-            '[class*="claude-message"]',
+            '[class*="claude-message"] .prose',
             '[data-is-streaming="false"] .prose',
-            ".prose",
         ],
     },
     "chatgpt": {
@@ -67,13 +70,22 @@ SITES: dict[str, dict] = {
         "url":          "https://www.perplexity.ai/",
         "url_match":    "perplexity.ai",
         "input":        [
+            # Lexical editor — target by id first, then by attributes
+            '#ask-input',
+            'div[data-lexical-editor="true"]',
+            'div[contenteditable="true"][aria-placeholder]',
             'textarea[placeholder*="Ask"]',
-            'textarea[placeholder]',
             'div[contenteditable="true"]',
         ],
         "stop_btn":     'button[aria-label="Stop"]',
         "send_btn":     'button[aria-label="Submit"]',
-        "response_sel": [".prose", ".answer-text", "[class*='answer']"],
+        "response_sel": [
+            ".prose",
+            "[class*='answer-content']",
+            "[class*='response-content']",
+            ".answer-text",
+            "[class*='answer']",
+        ],
     },
     "grok": {
         "url":          "https://grok.com/",
@@ -141,24 +153,29 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
         )
     _save_debug(page, agent, "01_before_type")
     el.click()
-    # Choose insertion method based on element type:
-    # - textarea/input: fill() works natively and triggers React state
-    # - contenteditable (ProseMirror etc): execCommand('insertText') is needed
     tag = el.evaluate("el => el.tagName.toLowerCase()")
+    is_lexical = el.evaluate(
+        "el => el.hasAttribute('data-lexical-editor') || el.getAttribute('role') === 'textbox'"
+    )
+
     if tag in ("textarea", "input"):
+        # Native fill triggers React state correctly
         el.fill(message)
-        # Trigger React's synthetic events on the SAME element we just filled
-        # (re-querying by selector could hit a different match than _resolve_selector did).
         el.dispatch_event("input")
         el.dispatch_event("change")
+    elif is_lexical:
+        # Lexical ignores execCommand — it only tracks real keyboard events.
+        # Select-all then type the whole message (no delay → fast even for long msgs).
+        page.keyboard.press("Control+a")
+        page.keyboard.type(message)
     else:
+        # ProseMirror and similar: execCommand is the reliable path
         page.evaluate(
             "text => { document.execCommand('selectAll'); "
             "document.execCommand('insertText', false, text); }",
             message,
         )
-    # Wait for the editor to register the full input before submitting.
-    time.sleep(0.8)
+    time.sleep(0.5)
 
     submitted = False
     send_sel = site.get("send_btn")
@@ -172,13 +189,28 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
         except Exception:
             pass
     if not submitted:
-        # JS fallback: find a submit/send button without relying on a specific selector
+        # Find the submit button closest to the focused input, then fall back globally.
         try:
             clicked = page.evaluate("""() => {
+                function tryClick(root) {
+                    const btns = [...(root ? root.querySelectorAll('button') :
+                                              document.querySelectorAll('button'))];
+                    const b = btns.find(b => !b.disabled && b.offsetParent !== null);
+                    if (b) { b.click(); return true; }
+                    return false;
+                }
+                // 1. Look inside the composer container wrapping the active element
+                const active = document.activeElement;
+                const composer = active &&
+                    (active.closest('form') ||
+                     active.closest('[class*="composer"]') ||
+                     active.closest('[class*="input"]'));
+                if (composer && tryClick(composer)) return true;
+                // 2. Labelled send/submit/ask buttons anywhere
                 const labels = ['submit','send','ask'];
                 for (const b of document.querySelectorAll('button')) {
                     const lbl = (b.getAttribute('aria-label') || b.textContent || '').toLowerCase();
-                    if (labels.some(l => lbl.includes(l)) && !b.disabled) {
+                    if (labels.some(l => lbl.includes(l)) && !b.disabled && b.offsetParent !== null) {
                         b.click(); return true;
                     }
                 }
@@ -189,8 +221,6 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
         except Exception:
             pass
     if not submitted:
-        # Plain Enter works for most chat UIs (both contenteditable and textarea).
-        # Control+Return is NOT used — it adds a newline in Perplexity/Slack-style boxes.
         el.press("Enter")
 
 
