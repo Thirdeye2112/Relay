@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-relay — minimal AI agent debate & collaboration shell
+relay -- minimal AI agent debate & collaboration shell
 
 Commands:
   debate <agent-a> <agent-b> "<topic>" [--rounds N]   start a new debate
   resume <session-id>               [--rounds N]        continue a debate
   chat   <agent>                    [--session ID]      talk to a single agent
-  inject <session-id> <agent> "<message>"               inject mid-debate
+  inject <session-id> <agent|all> "<message>"           inject mid-debate
   list                                                   show all sessions
   show   <session-id>                                   print full transcript
 """
 
 import os
+import re
 import sys
 import json
 import argparse
@@ -22,50 +23,62 @@ from dataclasses import dataclass
 try:
     import yaml
 except ImportError:
-    sys.exit("pyyaml not installed — run: pip install -r requirements.txt")
+    sys.exit("pyyaml not installed -- run: pip install -r requirements.txt")
 
-# ── Paths ──────────────────────────────────────────────────────────────────────
+# -- Paths ---------------------------------------------------------------------
 
 BASE_DIR     = Path(__file__).parent
 SESSIONS_DIR = BASE_DIR / "sessions"
 AGENTS_FILE  = BASE_DIR / "agents.yaml"
 
-# ── Types ──────────────────────────────────────────────────────────────────────
+# -- Types ---------------------------------------------------------------------
 
 @dataclass
 class AgentConfig:
     name:          str
-    provider:      str   # "anthropic" | "openai" | "browser"
+    provider:      str   # "anthropic" | "openai" | "perplexity" | "browser"
     model:         str
     system_prompt: str
     mode:          str = "api"   # "api" | "browser"
+    base_url:      str = ""
 
 @dataclass
 class Message:
     role:    str   # "system" | "user" | "assistant"
     content: str
 
-# ── Agent registry ─────────────────────────────────────────────────────────────
+# -- Agent registry ------------------------------------------------------------
 
 def load_agents() -> dict[str, AgentConfig]:
     if not AGENTS_FILE.exists():
         sys.exit(f"agents.yaml not found at {AGENTS_FILE}")
     with open(AGENTS_FILE, encoding="utf-8") as f:
-        raw = yaml.safe_load(f)
-    return {
-        name: AgentConfig(
+        raw = yaml.safe_load(f) or {}
+
+    agents = {}
+    for name, cfg in raw.get("agents", {}).items():
+        provider = cfg.get("provider", "anthropic").lower()
+        base_url = cfg.get("base_url", "")
+        if provider == "perplexity" and not base_url:
+            base_url = "https://api.perplexity.ai"
+        agents[name] = AgentConfig(
             name          = name,
-            provider      = cfg.get("provider", "anthropic"),
+            provider      = provider,
             model         = cfg.get("model", "claude-sonnet-4-6"),
             system_prompt = cfg.get("system_prompt", ""),
             mode          = cfg.get("mode", "api"),
+            base_url      = base_url,
         )
-        for name, cfg in raw.get("agents", {}).items()
-    }
+    return agents
 
-# ── Session I/O ────────────────────────────────────────────────────────────────
+# -- Session I/O (plain-text format with JSONL backward compat) ----------------
+
+_ROLE_RE = re.compile(r"^\[(system|user|assistant)\]$", re.MULTILINE)
 
 def session_path(session_id: str, agent_name: str) -> Path:
+    return SESSIONS_DIR / session_id / f"{agent_name}.txt"
+
+def _legacy_path(session_id: str, agent_name: str) -> Path:
     return SESSIONS_DIR / session_id / f"{agent_name}.jsonl"
 
 def meta_path(session_id: str) -> Path:
@@ -73,10 +86,27 @@ def meta_path(session_id: str) -> Path:
 
 def load_session(session_id: str, agent_name: str) -> list[Message]:
     path = session_path(session_id, agent_name)
-    if not path.exists():
-        return []
+    legacy = _legacy_path(session_id, agent_name)
+
+    if path.exists():
+        return _parse_text(path.read_text(encoding="utf-8"))
+    if legacy.exists():
+        return _parse_jsonl(legacy.read_text(encoding="utf-8"))
+    return []
+
+def _parse_text(text: str) -> list[Message]:
+    parts = _ROLE_RE.split(text)
+    # parts: ['preamble', 'system', 'content\n', 'user', 'content\n', ...]
     messages = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for i in range(1, len(parts), 2):
+        role    = parts[i]
+        content = parts[i + 1].strip() if i + 1 < len(parts) else ""
+        messages.append(Message(role=role, content=content))
+    return messages
+
+def _parse_jsonl(text: str) -> list[Message]:
+    messages = []
+    for line in text.splitlines():
         line = line.strip()
         if line:
             d = json.loads(line)
@@ -87,7 +117,7 @@ def append_message(session_id: str, agent_name: str, msg: Message) -> None:
     path = session_path(session_id, agent_name)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps({"role": msg.role, "content": msg.content}) + "\n")
+        f.write(f"\n[{msg.role}]\n{msg.content}\n")
 
 def load_meta(session_id: str) -> dict:
     path = meta_path(session_id)
@@ -98,80 +128,106 @@ def load_meta(session_id: str) -> dict:
 def save_meta(session_id: str, meta: dict) -> None:
     path = meta_path(session_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
 
-# ── API calls ──────────────────────────────────────────────────────────────────
+# -- Client cache (one TLS connection per provider) ----------------------------
+
+_CLIENTS: dict = {}
+
+def _get_openai_client(api_key: str, base_url: str | None):
+    from openai import OpenAI
+    key = (api_key[:8], base_url)
+    if key not in _CLIENTS:
+        kwargs: dict = {"api_key": api_key, "timeout": 60.0, "max_retries": 2}
+        if base_url:
+            kwargs["base_url"] = base_url
+        _CLIENTS[key] = OpenAI(**kwargs)
+    return _CLIENTS[key]
+
+def _get_anthropic_client(api_key: str):
+    import anthropic
+    if "anthropic" not in _CLIENTS:
+        _CLIENTS["anthropic"] = anthropic.Anthropic(
+            api_key=api_key, timeout=60.0, max_retries=2
+        )
+    return _CLIENTS["anthropic"]
+
+# -- API calls -----------------------------------------------------------------
 
 def call_anthropic(model: str, messages: list[Message]) -> str:
     try:
         import anthropic
     except ImportError:
-        sys.exit("anthropic SDK not installed — run: pip install anthropic")
+        sys.exit("anthropic SDK not installed -- run: pip install anthropic")
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         sys.exit("ANTHROPIC_API_KEY not set")
 
-    client = anthropic.Anthropic(api_key=api_key)
-
+    client = _get_anthropic_client(api_key)
     system = next((m.content for m in messages if m.role == "system"), "")
     api_msgs = [{"role": m.role, "content": m.content}
                 for m in messages if m.role != "system"]
 
     response = client.messages.create(
-        model      = model,
-        max_tokens = 2048,
-        system     = system,
-        messages   = api_msgs,
+        model=model, max_tokens=2048, system=system, messages=api_msgs,
     )
     return response.content[0].text
 
-def call_openai(model: str, messages: list[Message]) -> str:
+def call_openai_compatible(agent: AgentConfig, messages: list[Message]) -> str:
     try:
-        from openai import OpenAI
+        from openai import OpenAI  # noqa: F401
     except ImportError:
-        sys.exit("openai SDK not installed — run: pip install openai")
+        sys.exit("openai SDK not installed -- run: pip install openai")
 
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        sys.exit("OPENAI_API_KEY not set")
+    if agent.provider == "perplexity":
+        api_key = os.environ.get("PERPLEXITY_API_KEY")
+        if not api_key:
+            sys.exit("PERPLEXITY_API_KEY not set")
+    else:
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            sys.exit("OPENAI_API_KEY not set")
 
-    client   = OpenAI(api_key=api_key)
+    client   = _get_openai_client(api_key, agent.base_url or None)
     response = client.chat.completions.create(
-        model     = model,
-        messages  = [{"role": m.role, "content": m.content} for m in messages],
-        max_tokens= 2048,
+        model    = agent.model,
+        messages = [{"role": m.role, "content": m.content} for m in messages],
+        max_tokens = 2048,
     )
     return response.choices[0].message.content
 
 def call_agent(agent: AgentConfig, messages: list[Message]) -> str:
     if agent.provider == "anthropic":
         return call_anthropic(agent.model, messages)
-    if agent.provider == "openai":
-        return call_openai(agent.model, messages)
-    sys.exit(f"Unknown provider '{agent.provider}' — must be anthropic or openai")
+    if agent.provider in ("openai", "perplexity"):
+        return call_openai_compatible(agent, messages)
+    sys.exit(
+        f"Unknown provider '{agent.provider}' -- must be anthropic, openai, or perplexity"
+    )
 
-# ── System prompt ──────────────────────────────────────────────────────────────
+def safe_call_agent(agent: AgentConfig, messages: list[Message]) -> str:
+    try:
+        return call_agent(agent, messages)
+    except Exception as e:
+        return f"[ERROR from {agent.name} ({agent.provider}/{agent.model}): {type(e).__name__}: {e}]"
+
+# -- System prompt -------------------------------------------------------------
 
 def build_system(agent: AgentConfig, opponent: str, topic: str) -> str:
-    """
-    Prepend identity + debate context to the agent's base system prompt.
-    Replaces OPPONENT placeholder with the actual opponent name.
-    """
     header = (
         f"Your name is {agent.name.upper()}.\n"
         f"You are debating {opponent.upper()} on: \"{topic}\"\n\n"
         f"Address {opponent.upper()} by name when responding to their specific points.\n"
-        f"End each response with:  — {agent.name.upper()}\n\n"
+        f"End each response with: -- {agent.name.upper()}\n\n"
     )
-    # Allow agents.yaml to use OPPONENT as a placeholder
     base = agent.system_prompt.replace("OPPONENT", opponent.upper())
     return header + base
 
-# ── Print helpers ──────────────────────────────────────────────────────────────
+# -- Print helpers -------------------------------------------------------------
 
-DIVIDER  = "━" * 62
-SUBDIV   = "─" * 62
+DIVIDER = "=" * 62
+SUBDIV  = "-" * 62
 
 def banner(session_id: str, topic: str, a: str, b: str, rounds: int) -> None:
     print(f"\n{DIVIDER}")
@@ -184,7 +240,7 @@ def banner(session_id: str, topic: str, a: str, b: str, rounds: int) -> None:
 def print_reply(name: str, text: str) -> None:
     print(f"\n[{name.upper()}]\n{text}\n")
 
-# ── debate command ─────────────────────────────────────────────────────────────
+# -- debate command ------------------------------------------------------------
 
 def cmd_debate(args, agents: dict[str, AgentConfig]) -> None:
     a_name, b_name = args.agent_a, args.agent_b
@@ -211,19 +267,17 @@ def cmd_debate(args, agents: dict[str, AgentConfig]) -> None:
     }
     save_meta(session_id, meta)
 
-    # Seed each agent's session with their identity-aware system prompt
     append_message(session_id, a_name, Message("system", build_system(agent_a, b_name, topic)))
     append_message(session_id, b_name, Message("system", build_system(agent_b, a_name, topic)))
 
-    # Opening user prompt — same for both
+    # Seed A with the opening prompt; B gets it on first turn (after seeing A's reply)
     opening = f'Topic: "{topic}"\n\nGive your opening position.'
     append_message(session_id, a_name, Message("user", opening))
-    append_message(session_id, b_name, Message("user", opening))
 
     banner(session_id, topic, a_name, b_name, rounds)
-    _run_rounds(session_id, agent_a, agent_b, a_name, b_name, meta, rounds)
+    _run_rounds(session_id, agent_a, agent_b, a_name, b_name, meta, rounds, first_round=True)
 
-# ── resume command ─────────────────────────────────────────────────────────────
+# -- resume command ------------------------------------------------------------
 
 def cmd_resume(args, agents: dict[str, AgentConfig]) -> None:
     session_id = args.session_id
@@ -238,12 +292,11 @@ def cmd_resume(args, agents: dict[str, AgentConfig]) -> None:
 
     agent_a = agents[a_name]
     agent_b = agents[b_name]
-    topic   = meta["topic"]
     rounds  = args.rounds
 
     print(f"\n{DIVIDER}")
     print(f"  RESUMING {session_id}")
-    print(f"  TOPIC    {topic}")
+    print(f"  TOPIC    {meta['topic']}")
     print(f"  AGENTS   {a_name.upper()} vs {b_name.upper()}")
     print(f"  DONE     {meta['rounds_completed']} rounds  +  {rounds} more")
     print(f"{DIVIDER}\n")
@@ -258,31 +311,36 @@ def _run_rounds(
     b_name:     str,
     meta:       dict,
     rounds:     int,
+    first_round: bool = False,
 ) -> None:
     start = meta["rounds_completed"] + 1
+
     for r in range(start, start + rounds):
         print(f"\n{SUBDIV}")
         print(f"  Round {r}")
         print(f"{SUBDIV}")
 
-        # ── Agent A speaks ────────────────────────────────────────────────────
+        # Agent A speaks
         print(f"\n  [{a_name.upper()} thinking...]")
-        reply_a = call_agent(agent_a, load_session(session_id, a_name))
-
-        # A's response goes into A's own history as assistant
+        reply_a = safe_call_agent(agent_a, load_session(session_id, a_name))
         append_message(session_id, a_name, Message("assistant", reply_a))
-        # A's response goes into B's history as a user message (prefixed with A's name)
+        # Cross-inject A's reply into B's context
         append_message(session_id, b_name, Message("user", f"[{a_name.upper()}]: {reply_a}"))
+
+        # If this is the very first round, give B the opening prompt before it replies
+        if first_round and r == start:
+            opening = f'Topic: "{meta["topic"]}"\n\nGive your opening position.'
+            if not any(m.role == "user" for m in load_session(session_id, b_name)
+                       if not m.content.startswith(f"[{a_name.upper()}]")):
+                append_message(session_id, b_name, Message("user", opening))
 
         print_reply(a_name, reply_a)
 
-        # ── Agent B speaks ────────────────────────────────────────────────────
+        # Agent B speaks
         print(f"  [{b_name.upper()} thinking...]")
-        reply_b = call_agent(agent_b, load_session(session_id, b_name))
-
-        # B's response goes into B's own history as assistant
+        reply_b = safe_call_agent(agent_b, load_session(session_id, b_name))
         append_message(session_id, b_name, Message("assistant", reply_b))
-        # B's response goes into A's history as a user message (prefixed with B's name)
+        # Cross-inject B's reply into A's context
         append_message(session_id, a_name, Message("user", f"[{b_name.upper()}]: {reply_b}"))
 
         print_reply(b_name, reply_b)
@@ -295,7 +353,7 @@ def _run_rounds(
     print(f"  Show:           python relay.py show   {session_id}")
     print(f"{DIVIDER}\n")
 
-# ── chat command ───────────────────────────────────────────────────────────────
+# -- chat command --------------------------------------------------------------
 
 def cmd_chat(args, agents: dict[str, AgentConfig]) -> None:
     agent_name = args.agent
@@ -306,7 +364,6 @@ def cmd_chat(args, agents: dict[str, AgentConfig]) -> None:
     ts    = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     sid   = args.session or f"chat-{agent_name}-{ts}"
 
-    # Seed system prompt if new session
     if not load_session(sid, agent_name):
         append_message(sid, agent_name, Message("system", agent.system_prompt))
 
@@ -334,28 +391,37 @@ def cmd_chat(args, agents: dict[str, AgentConfig]) -> None:
 
         append_message(sid, agent_name, Message("user", user_input))
         print(f"\n  [{agent_name.upper()} thinking...]\n")
-        reply = call_agent(agent, load_session(sid, agent_name))
+        reply = safe_call_agent(agent, load_session(sid, agent_name))
         append_message(sid, agent_name, Message("assistant", reply))
         print_reply(agent_name, reply)
 
-# ── inject command ─────────────────────────────────────────────────────────────
+# -- inject command ------------------------------------------------------------
 
 def cmd_inject(args, agents: dict[str, AgentConfig]) -> None:
-    session_id  = args.session_id
-    agent_name  = args.agent
-    message     = args.message
+    session_id = args.session_id
+    agent_arg  = args.agent      # agent name or "all"
+    message    = args.message
 
     meta = load_meta(session_id)
     if not meta:
         sys.exit(f"Session not found: {session_id}")
-    if agent_name not in meta.get("agents", []):
-        sys.exit(f"Agent '{agent_name}' is not in session {session_id}")
 
-    append_message(session_id, agent_name, Message("user", f"[MODERATOR]: {message}"))
-    print(f"\n  Injected into {agent_name.upper()}'s context in session {session_id}")
+    session_agents = meta.get("agents", [])
+    if agent_arg == "all":
+        targets = session_agents
+    else:
+        if agent_arg not in session_agents:
+            sys.exit(f"Agent '{agent_arg}' is not in session {session_id}")
+        targets = [agent_arg]
+
+    for target in targets:
+        append_message(session_id, target, Message("user", f"[MODERATOR]: {message}"))
+
+    label = "all agents" if agent_arg == "all" else agent_arg.upper()
+    print(f"\n  Injected into {label} in session {session_id}")
     print(f"  Run: python relay.py resume {session_id}\n")
 
-# ── list command ───────────────────────────────────────────────────────────────
+# -- list command --------------------------------------------------------------
 
 def cmd_list(args, agents: dict[str, AgentConfig]) -> None:
     if not SESSIONS_DIR.exists() or not list(SESSIONS_DIR.iterdir()):
@@ -364,7 +430,7 @@ def cmd_list(args, agents: dict[str, AgentConfig]) -> None:
 
     sessions = sorted(SESSIONS_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
     print(f"\n  {'SESSION':<44} {'AGENTS':<25} ROUNDS  TOPIC")
-    print(f"  {'─'*95}")
+    print(f"  {'-'*95}")
     for s in sessions:
         m = load_meta(s.name)
         if not m:
@@ -375,7 +441,7 @@ def cmd_list(args, agents: dict[str, AgentConfig]) -> None:
         print(f"  {s.name:<44} {pair:<25} {rounds:<7} {topic}")
     print()
 
-# ── show command ───────────────────────────────────────────────────────────────
+# -- show command --------------------------------------------------------------
 
 def cmd_show(args, agents: dict[str, AgentConfig]) -> None:
     session_id = args.session_id
@@ -383,31 +449,29 @@ def cmd_show(args, agents: dict[str, AgentConfig]) -> None:
     if not meta:
         sys.exit(f"Session not found: {session_id}")
 
-    a_name = meta["agents"][0]
-
     print(f"\n{DIVIDER}")
     print(f"  SESSION  {session_id}")
     print(f"  TOPIC    {meta.get('topic', '?')}")
     print(f"  ROUNDS   {meta.get('rounds_completed', '?')}")
     print(f"{DIVIDER}\n")
 
-    # Read from agent A's history — it contains the full interleaved debate:
-    # user messages = B's injected responses (prefixed "[B]:") + opening prompt
-    # assistant messages = A's own responses
-    for msg in load_session(session_id, a_name):
-        if msg.role == "system":
-            continue
-        if msg.role == "assistant":
-            print(f"[{a_name.upper()}]\n{msg.content}\n")
-        elif msg.role == "user":
-            if msg.content.startswith("["):
-                # Opponent's injected message — already labelled
-                print(f"{msg.content}\n")
-            else:
-                # Opening prompt
-                print(f"[TOPIC]\n{msg.content}\n")
+    for agent_name in meta.get("agents", []):
+        print(f"\n{'-'*30} {agent_name.upper()} {'-'*30}\n")
+        for msg in load_session(session_id, agent_name):
+            if msg.role == "system":
+                if getattr(args, "show_system", False):
+                    print(f"[SYSTEM]\n{msg.content}\n")
+                continue
+            if msg.role == "assistant":
+                print(f"[{agent_name.upper()}]\n{msg.content}\n")
+            elif msg.role == "user":
+                prefix = f"[{next(n.upper() for n in meta['agents'] if n != agent_name)}]"
+                if msg.content.startswith("["):
+                    print(f"{msg.content}\n")
+                else:
+                    print(f"[TOPIC]\n{msg.content}\n")
 
-# ── Entry point ────────────────────────────────────────────────────────────────
+# -- Entry point ---------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -417,16 +481,17 @@ def main() -> None:
         epilog = """
 examples:
   python relay.py debate analyst critic "monorepo vs polyrepo" --rounds 5
-  python relay.py resume debate-analyst-critic-20260622-143022 --rounds 3
-  python relay.py inject debate-analyst-critic-20260622-143022 analyst "what about CI cost?"
+  python relay.py resume debate-analyst-critic-20260623-143022 --rounds 3
+  python relay.py inject debate-analyst-critic-20260623-143022 all "wrap up in one paragraph"
+  python relay.py inject debate-analyst-critic-20260623-143022 analyst "what about CI cost?"
   python relay.py chat analyst
   python relay.py list
-  python relay.py show debate-analyst-critic-20260622-143022
+  python relay.py show debate-analyst-critic-20260623-143022
 """,
     )
     sub = parser.add_subparsers(dest="cmd")
 
-    p = sub.add_parser("debate", help="Start a new agent debate")
+    p = sub.add_parser("debate", help="Start a new debate")
     p.add_argument("agent_a")
     p.add_argument("agent_b")
     p.add_argument("topic")
@@ -440,15 +505,17 @@ examples:
     p.add_argument("agent")
     p.add_argument("--session", help="Resume a specific chat session ID")
 
-    p = sub.add_parser("inject", help="Inject a message into a running debate")
+    p = sub.add_parser("inject", help="Inject a message into a debate context")
     p.add_argument("session_id")
-    p.add_argument("agent")
+    p.add_argument("agent", help="Agent name, or 'all' to broadcast to every agent")
     p.add_argument("message")
 
     sub.add_parser("list", help="List all sessions")
 
-    p = sub.add_parser("show", help="Print a session's full transcript")
+    p = sub.add_parser("show", help="Print each agent's full context")
     p.add_argument("session_id")
+    p.add_argument("--show-system", action="store_true",
+                   help="Also print system prompts")
 
     args = parser.parse_args()
     if not args.cmd:

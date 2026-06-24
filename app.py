@@ -288,13 +288,12 @@ def _build_synthesis_prompt(user_msg: str, replies: dict) -> str:
     return "\n".join(lines)
 
 def run_synthesis(sid: str, user_msg: str, replies: dict) -> None:
-    """Run a synthesis pass using the first available API agent."""
-    synth_cfg = next(
-        (c for c in agents_cfg.values() if getattr(c, "mode", "api") == "api" and agent_active(c)),
-        None,
-    )
-    if not synth_cfg or not replies:
+    """Synthesize the round via Anthropic API directly (no agent-mode dependency)."""
+    if not replies:
         return
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return  # silently skip -- user hasn't set a key
 
     prompt = _build_synthesis_prompt(user_msg, replies)
     synth_msgs = [
@@ -305,7 +304,9 @@ def run_synthesis(sid: str, user_msg: str, replies: dict) -> None:
     with st.chat_message("synthesis", avatar="🔮"):
         st.markdown("**SYNTHESIS**")
         try:
-            synthesis = st.write_stream(stream_agent(synth_cfg, synth_msgs))
+            synthesis = st.write_stream(
+                _stream_anthropic("claude-haiku-4-5-20251001", synth_msgs)
+            )
         except Exception as e:
             st.error(_api_error(e))
             return
