@@ -347,20 +347,57 @@ def _build_synthesis_prompt(user_msg: str, replies: dict) -> str:
     )
     return "\n".join(lines)
 
-def run_synthesis(sid: str, user_msg: str, replies: dict, round_id: int | None = None) -> None:
-    """Synthesize the round via Anthropic API directly (no agent-mode dependency)."""
+def run_synthesis(sid: str, user_msg: str, replies: dict, round_id: int | None = None,
+                   mgr: Optional["BrowserManager"] = None) -> None:
+    """Synthesize the round.
+
+    Prefers reusing one of THIS round's successfully-replying browser agents
+    (no separate API key, no extra cost, consistent with every other agent
+    in Relay) -- falls back to a direct Anthropic API call only if no
+    browser agent is available (e.g. an all-API-mode session) and a funded
+    ANTHROPIC_API_KEY is set. The old default (always call Anthropic
+    directly) required a real billed API key -- a different account/cost
+    from a Claude.ai subscription -- which is exactly what broke.
+    """
     if not replies:
         return
+    prompt = _build_synthesis_prompt(user_msg, replies)
+
+    browser_synth_agent = next(
+        (n for n in replies if mgr and mgr.has_agent(n)), None
+    )
+
+    if browser_synth_agent:
+        synth_prompt = (
+            "Set aside your own position for a moment. Acting as a neutral "
+            "synthesizer, not as a participant, synthesize the discussion above:\n\n"
+            + prompt
+        )
+        with st.chat_message("synthesis", avatar="🔮"):
+            st.markdown(f"**SYNTHESIS** (via {browser_synth_agent.upper()})")
+            with st.spinner(f"Synthesizing via {browser_synth_agent.upper()}…"):
+                try:
+                    synthesis = mgr.send_message(browser_synth_agent, synth_prompt)
+                except Exception as e:
+                    st.error(f"Synthesis failed: {e}")
+                    return
+            if _is_relay_failure(synthesis):
+                st.error(f"Synthesis failed: {synthesis}")
+                return
+            st.markdown(synthesis)
+        append_display(sid, {"type": "synthesis", "content": synthesis, "round_id": round_id})
+        return
+
+    # Fallback: direct Anthropic API call -- only reachable when no browser
+    # agent produced a reply this round.
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
-        return  # silently skip -- user hasn't set a key
+        return  # silently skip -- no browser agent available and no API key set
 
-    prompt = _build_synthesis_prompt(user_msg, replies)
     synth_msgs = [
         Message("system", "You are a neutral synthesizer. You do not have a side. You clarify."),
         Message("user", prompt),
     ]
-
     with st.chat_message("synthesis", avatar="🔮"):
         st.markdown("**SYNTHESIS**")
         try:
@@ -579,7 +616,7 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
 
     # ── Synthesizer ───────────────────────────────────────────────────────────
     if synthesize and len(successful_replies) > 1:
-        run_synthesis(sid, user_msg, successful_replies, round_id=round_id)
+        run_synthesis(sid, user_msg, successful_replies, round_id=round_id, mgr=mgr)
 
     # ── GitHub (background) ───────────────────────────────────────────────────
     if replies:
