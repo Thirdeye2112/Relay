@@ -330,40 +330,45 @@ def _build_cross_context(sid: str, my_name: str, participants: dict) -> str:
 
 
 def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = True) -> None:
+    mgr = get_manager()
+
+    # Only act on agents that are actually reachable right now.
+    # Browser agents need a linked tab; API agents need an active key.
+    def is_ready(name: str, cfg) -> bool:
+        if getattr(cfg, "mode", "api") == "browser":
+            return bool(mgr and mgr.has_agent(name))
+        return agent_active(cfg)
+
+    active = {n: c for n, c in participants.items() if is_ready(n, c)}
+    if not active:
+        st.warning("No agents are ready — link tabs in Agents or set API keys.")
+        return
+
     append_display(sid, {"type": "user", "content": user_msg})
-    for name in participants:
+    for name in active:
         append_message(sid, name, Message("user", user_msg))
 
     replies: dict = {}
 
     # ── Browser agents — submit all at once, wait in parallel ─────────────────
-    browser_agents = {n: c for n, c in participants.items()
+    browser_agents = {n: c for n, c in active.items()
                       if getattr(c, "mode", "api") == "browser"}
-    api_agents     = {n: c for n, c in participants.items()
+    api_agents     = {n: c for n, c in active.items()
                       if getattr(c, "mode", "api") != "browser"}
 
     if browser_agents:
-        mgr = get_manager()
         payloads: dict = {}
-        no_tab: list   = []
 
         for name, cfg in browser_agents.items():
-            if not mgr or not mgr.has_agent(name):
-                no_tab.append(name)
-                continue
             history  = load_session(sid, name)
             is_first = not any(m.role == "user" for m in history)
             if is_first:
                 msg_to_send = f"{cfg.system_prompt}\n\n---\n\n{user_msg}"
             else:
-                cross = _build_cross_context(sid, name, participants)
+                cross = _build_cross_context(sid, name, active)
                 msg_to_send = (f"{cross}\n\n---\n\nUser: {user_msg}"
                                if cross else user_msg)
             payloads[name] = msg_to_send
-
-        for name in no_tab:
-            with st.chat_message(name, avatar=avatar(name)):
-                st.error(f"{name.upper()} has no tab — assign one in Agents.")
 
         if payloads and mgr:
             agent_list = ", ".join(payloads.keys())
@@ -397,7 +402,7 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
         append_display(sid, {"type": "reply", "agent": name, "content": reply})
         append_message(sid, name, Message("assistant", reply))
 
-    for name in participants:
+    for name in active:
         for other, reply in replies.items():
             if other != name:
                 append_message(sid, name, Message("user", f"[{other.upper()}]: {reply}"))
@@ -412,7 +417,7 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
         if repo:
             meta = load_meta(sid)
             commit_async(_gh_append_round, repo, meta.get("topic", "conversation"),
-                         list(participants.keys()), user_msg, replies)
+                         list(active.keys()), user_msg, replies)
 
 # ── Session state ─────────────────────────────────────────────────────────────
 
