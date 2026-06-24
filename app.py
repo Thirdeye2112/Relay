@@ -319,9 +319,7 @@ def render_display(sid: str) -> None:
             with st.chat_message("user", avatar="🧑"):
                 st.markdown(ev["content"])
         elif ev["type"] == "reply":
-            name = ev["agent"]
-            with st.chat_message(name, avatar=avatar(name)):
-                st.markdown(f"**{name.upper()}**\n\n{ev['content']}")
+            _render_agent_reply(ev["agent"], ev["content"])
         elif ev["type"] == "synthesis":
             with st.chat_message("synthesis", avatar="🔮"):
                 st.markdown(f"**SYNTHESIS**\n\n{ev['content']}")
@@ -349,7 +347,7 @@ def _build_synthesis_prompt(user_msg: str, replies: dict) -> str:
     )
     return "\n".join(lines)
 
-def run_synthesis(sid: str, user_msg: str, replies: dict) -> None:
+def run_synthesis(sid: str, user_msg: str, replies: dict, round_id: int | None = None) -> None:
     """Synthesize the round via Anthropic API directly (no agent-mode dependency)."""
     if not replies:
         return
@@ -373,7 +371,7 @@ def run_synthesis(sid: str, user_msg: str, replies: dict) -> None:
             st.error(_api_error(e))
             return
 
-    append_display(sid, {"type": "synthesis", "content": synthesis})
+    append_display(sid, {"type": "synthesis", "content": synthesis, "round_id": round_id})
 
 # ── Group round ───────────────────────────────────────────────────────────────
 
@@ -391,6 +389,19 @@ _FAILURE_PREFIXES = ("[Error:", "[Timed out]", "[No response captured", "[Not se
 def _is_relay_failure(text: str) -> bool:
     t = (text or "").strip()
     return t.startswith(_FAILURE_PREFIXES)
+
+
+def _render_agent_reply(name: str, content: str) -> None:
+    """Render one agent's turn -- a real reply as a normal chat bubble, a
+    transport failure as a visible system notice instead. Failures used to
+    render in an identical st.chat_message bubble to a real reply, reading
+    exactly like a panelist's turn instead of what it actually was.
+    """
+    if _is_relay_failure(content):
+        st.error(f"⚠ {name.upper()} — transport failure this round: {content}")
+    else:
+        with st.chat_message(name, avatar=avatar(name)):
+            st.markdown(f"**{name.upper()}**\n\n{content}")
 
 
 def _build_cross_context(sid: str, my_name: str, participants: dict) -> str:
@@ -454,7 +465,26 @@ def _build_browser_msg(sid: str, name: str, cfg, active: dict, user_msg: str) ->
     return f"{cross}\n\n---\n\nUser: {user_msg}" if cross else user_msg
 
 
-def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = True) -> None:
+def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = True,
+              round_label: str | None = None) -> int:
+    """Run one round. Returns the round_id stamped onto every display event
+    this call writes, for auditing/debugging (e.g. matching a payload dump
+    in the 🔍 expander to exactly which round produced it).
+
+    round_id lives only in meta.json + display.jsonl (app.py's own files) --
+    deliberately NOT stamped into relay.py's per-agent Message/.txt storage,
+    which is a separate, more sophisticated canonical-transcript system with
+    its own CLI and test suite that this polish pass isn't touching.
+    """
+    meta = load_meta(sid)
+    round_id = meta.get("round_count", 0) + 1
+    meta["round_count"] = round_id
+    save_meta(sid, meta)
+
+    label = round_label or f"Round {round_id}"
+    st.caption(label)
+    append_display(sid, {"type": "auto_round_marker", "content": label, "round_id": round_id})
+
     mgr = get_manager()
 
     def is_ready(name: str, cfg) -> bool:
@@ -465,7 +495,7 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
     active = {n: c for n, c in participants.items() if is_ready(n, c)}
     if not active:
         st.warning("No agents are ready — link tabs in Agents or set API keys.")
-        return
+        return round_id
 
     browser_agents = {n: c for n, c in active.items()
                       if getattr(c, "mode", "api") == "browser"}
@@ -488,9 +518,9 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
         _dump_payloads_to_disk(payloads)
 
     # Now commit the user turn to all agent histories and the display log.
-    append_display(sid, {"type": "user", "content": user_msg})
+    append_display(sid, {"type": "user", "content": user_msg, "round_id": round_id})
     if payloads:
-        append_display(sid, {"type": "payload_dump", "payloads": payloads})
+        append_display(sid, {"type": "payload_dump", "payloads": payloads, "round_id": round_id})
     for name in active:
         append_message(sid, name, Message("user", user_msg))
 
@@ -509,9 +539,7 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
         for name in browser_agents:
             if name not in replies:
                 continue
-            with st.chat_message(name, avatar=avatar(name)):
-                st.markdown(f"**{name.upper()}**")
-                st.markdown(replies[name])
+            _render_agent_reply(name, replies[name])
 
     # ── API agents — sequential with streaming ─────────────────────────────────
     for name, cfg in api_agents.items():
@@ -525,7 +553,7 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
 
     # ── Persist replies ────────────────────────────────────────────────────────
     for name, reply in replies.items():
-        append_display(sid, {"type": "reply", "agent": name, "content": reply})
+        append_display(sid, {"type": "reply", "agent": name, "content": reply, "round_id": round_id})
         append_message(sid, name, Message("assistant", reply))
 
     # Cross-inject all other agents' replies as ONE bundled user message.
@@ -551,7 +579,7 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
 
     # ── Synthesizer ───────────────────────────────────────────────────────────
     if synthesize and len(successful_replies) > 1:
-        run_synthesis(sid, user_msg, successful_replies)
+        run_synthesis(sid, user_msg, successful_replies, round_id=round_id)
 
     # ── GitHub (background) ───────────────────────────────────────────────────
     if replies:
@@ -561,11 +589,12 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
             commit_async(_gh_append_round, repo, meta.get("topic", "conversation"),
                          list(active.keys()), user_msg, replies)
 
+    return round_id
+
 
 _AUTO_CONTINUE_MSG = (
-    "Continue the discussion. Respond directly to what the other panelists "
-    "just said above — agree, disagree, build on it, or raise a new angle. "
-    "Keep it substantive."
+    "Continue the discussion. Read the other panelists' latest replies "
+    "above and respond directly. Do not restart the topic."
 )
 
 def run_auto_rounds(sid: str, participants: dict, user_msg: str,
@@ -588,10 +617,8 @@ def run_auto_rounds(sid: str, participants: dict, user_msg: str,
     """
     run_round(sid, participants, user_msg, synthesize=synthesize)
     for i in range(2, n_rounds + 1):
-        marker = f"🔁 Auto-continuing — round {i}/{n_rounds}"
-        st.caption(marker)
-        append_display(sid, {"type": "auto_round_marker", "content": marker})
-        run_round(sid, participants, _AUTO_CONTINUE_MSG, synthesize=synthesize)
+        marker = f"🔁 Round {i}/{n_rounds} — auto-continuing"
+        run_round(sid, participants, _AUTO_CONTINUE_MSG, synthesize=synthesize, round_label=marker)
 
 
 # ── Session state ─────────────────────────────────────────────────────────────
@@ -677,6 +704,7 @@ if mode == "Conversations":
                 "session_id": sid, "type": "group_chat",
                 "topic":      topic.strip(), "agents": all_names,
                 "created":    datetime.datetime.now().isoformat(),
+                "round_count": 0,
             }
             save_meta(sid, meta)
             for name, cfg in agents_cfg.items():
@@ -733,7 +761,7 @@ if mode == "Conversations":
                                        help="After each round, a neutral pass summarizes agreements, tensions, and missed angles.")
             with sc2:
                 auto_rounds = st.number_input(
-                    "🔁 Auto-rounds", min_value=1, max_value=10, value=1,
+                    "🔁 Max rounds", min_value=1, max_value=10, value=3,
                     help="Push your message once, then let the panel go back and "
                          "forth this many rounds with no further input from you. "
                          "Each round costs real model usage across every tab, and "
