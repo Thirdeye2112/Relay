@@ -73,7 +73,12 @@ def load_agents() -> dict[str, AgentConfig]:
 
 # -- Session I/O (plain-text format with JSONL backward compat) ----------------
 
-_ROLE_RE = re.compile(r"^\[(system|user|assistant)\]$", re.MULTILINE)
+# Unique delimiter unlikely to appear in LLM output.
+# Format:  \n~~~ RELAY:ROLE ~~~\ncontent\n
+# The regex matches the marker ONLY when it is the entire line (^ and $ with MULTILINE),
+# so `[user]` embedded in prose does NOT accidentally split.
+_MARKER_RE = re.compile(r"^~~~ RELAY:(SYSTEM|USER|ASSISTANT) ~~~$", re.MULTILINE)
+_MARKER    = "~~~ RELAY:{} ~~~"
 
 def session_path(session_id: str, agent_name: str) -> Path:
     return SESSIONS_DIR / session_id / f"{agent_name}.txt"
@@ -85,9 +90,8 @@ def meta_path(session_id: str) -> Path:
     return SESSIONS_DIR / session_id / "meta.json"
 
 def load_session(session_id: str, agent_name: str) -> list[Message]:
-    path = session_path(session_id, agent_name)
+    path   = session_path(session_id, agent_name)
     legacy = _legacy_path(session_id, agent_name)
-
     if path.exists():
         return _parse_text(path.read_text(encoding="utf-8"))
     if legacy.exists():
@@ -95,11 +99,11 @@ def load_session(session_id: str, agent_name: str) -> list[Message]:
     return []
 
 def _parse_text(text: str) -> list[Message]:
-    parts = _ROLE_RE.split(text)
-    # parts: ['preamble', 'system', 'content\n', 'user', 'content\n', ...]
+    parts = _MARKER_RE.split(text)
+    # parts: ['preamble', 'SYSTEM', 'content\n', 'USER', 'content\n', ...]
     messages = []
     for i in range(1, len(parts), 2):
-        role    = parts[i]
+        role    = parts[i].lower()
         content = parts[i + 1].strip() if i + 1 < len(parts) else ""
         messages.append(Message(role=role, content=content))
     return messages
@@ -117,7 +121,7 @@ def append_message(session_id: str, agent_name: str, msg: Message) -> None:
     path = session_path(session_id, agent_name)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
-        f.write(f"\n[{msg.role}]\n{msg.content}\n")
+        f.write(f"\n{_MARKER.format(msg.role.upper())}\n{msg.content}\n")
 
 def load_meta(session_id: str) -> dict:
     path = meta_path(session_id)
@@ -205,6 +209,18 @@ def call_agent(agent: AgentConfig, messages: list[Message]) -> str:
     sys.exit(
         f"Unknown provider '{agent.provider}' -- must be anthropic, openai, or perplexity"
     )
+
+MAX_TURNS = 30  # non-system messages kept per agent before trimming
+
+def trim_context(messages: list[Message]) -> list[Message]:
+    """Keep the system prompt + opening statement + last MAX_TURNS turns."""
+    system = [m for m in messages if m.role == "system"][:1]
+    rest   = [m for m in messages if m.role != "system"]
+    if len(rest) <= MAX_TURNS:
+        return system + rest
+    # Pin the first message (opening prompt / task), then take the tail
+    return system + [rest[0]] + rest[-(MAX_TURNS - 1):]
+
 
 def safe_call_agent(agent: AgentConfig, messages: list[Message]) -> str:
     try:
@@ -322,7 +338,7 @@ def _run_rounds(
 
         # Agent A speaks
         print(f"\n  [{a_name.upper()} thinking...]")
-        reply_a = safe_call_agent(agent_a, load_session(session_id, a_name))
+        reply_a = safe_call_agent(agent_a, trim_context(load_session(session_id, a_name)))
         append_message(session_id, a_name, Message("assistant", reply_a))
         # Cross-inject A's reply into B's context
         append_message(session_id, b_name, Message("user", f"[{a_name.upper()}]: {reply_a}"))
@@ -338,7 +354,7 @@ def _run_rounds(
 
         # Agent B speaks
         print(f"  [{b_name.upper()} thinking...]")
-        reply_b = safe_call_agent(agent_b, load_session(session_id, b_name))
+        reply_b = safe_call_agent(agent_b, trim_context(load_session(session_id, b_name)))
         append_message(session_id, b_name, Message("assistant", reply_b))
         # Cross-inject B's reply into A's context
         append_message(session_id, a_name, Message("user", f"[{b_name.upper()}]: {reply_b}"))
@@ -365,7 +381,12 @@ def cmd_chat(args, agents: dict[str, AgentConfig]) -> None:
     sid   = args.session or f"chat-{agent_name}-{ts}"
 
     if not load_session(sid, agent_name):
-        append_message(sid, agent_name, Message("system", agent.system_prompt))
+        # Use the raw system_prompt for chat (no opponent); still consistent with debate format
+        sys_prompt = (
+            f"Your name is {agent.name.upper()}.\n\n"
+            f"End each response with: -- {agent.name.upper()}\n\n"
+        ) + agent.system_prompt
+        append_message(sid, agent_name, Message("system", sys_prompt))
 
     print(f"\n  Talking to {agent_name.upper()}  (session: {sid})")
     print(f"  Commands: /show  /exit\n")
@@ -391,7 +412,7 @@ def cmd_chat(args, agents: dict[str, AgentConfig]) -> None:
 
         append_message(sid, agent_name, Message("user", user_input))
         print(f"\n  [{agent_name.upper()} thinking...]\n")
-        reply = safe_call_agent(agent, load_session(sid, agent_name))
+        reply = safe_call_agent(agent, trim_context(load_session(sid, agent_name)))
         append_message(sid, agent_name, Message("assistant", reply))
         print_reply(agent_name, reply)
 
