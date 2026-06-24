@@ -189,12 +189,9 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
         except Exception:
             pass
     if not submitted:
-        # Last resort: Enter (works for most chat inputs, Ctrl+Enter for textareas)
-        tag = el.evaluate("el => el.tagName.toLowerCase()")
-        if tag == "textarea":
-            el.press("Control+Return")
-        else:
-            el.press("Enter")
+        # Plain Enter works for most chat UIs (both contenteditable and textarea).
+        # Control+Return is NOT used — it adds a newline in Perplexity/Slack-style boxes.
+        el.press("Return")
 
 
 def _page_text(page) -> str:
@@ -511,8 +508,10 @@ class BrowserManager:
                     "page": page, "site": site,
                     "pre_len": pre_len, "pre_counts": pre_counts,
                     "prev_len": pre_len,
+                    "start": time.time(),
                     "deadline": time.time() + tout,
                     "stable": 0, "stop_seen": False, "new_el_seen": False,
+                    "el_check_at": time.time() + 3,  # first element check after 3s
                 }
             except Exception as e:
                 state[ag] = {"error": str(e)}
@@ -533,9 +532,9 @@ class BrowserManager:
                     results[ag] = cur[s["pre_len"]:].strip() or "[Timed out]"
                     continue
 
-                # Stop-button detection (fastest signal when selector is current)
-                stop_sel  = site.get("stop_btn")
-                stop_now  = False
+                # Stop-button (cheapest: single locator count call)
+                stop_sel = site.get("stop_btn")
+                stop_now = False
                 if stop_sel:
                     try:
                         stop_now = page.locator(stop_sel).count() > 0
@@ -550,15 +549,22 @@ class BrowserManager:
                         results[ag] = resp or "[No response captured]"
                         continue
 
-                # Element-count gate: don't start stability check until a
-                # new response element actually appears in the DOM.
+                # Element-count gate — only poll every 3s to keep overhead low.
+                # After 15s without a new element (selector drift), open the gate
+                # anyway so stable-text can fire rather than waiting for timeout.
                 if not s["new_el_seen"]:
-                    cur_counts = _response_counts(page, site)
-                    if any(cur_counts.get(sel, 0) > n
-                           for sel, n in s["pre_counts"].items()):
+                    now = time.time()
+                    if now >= s["el_check_at"]:
+                        cur_counts = _response_counts(page, site)
+                        if any(cur_counts.get(sel, 0) > n
+                               for sel, n in s["pre_counts"].items()):
+                            s["new_el_seen"] = True
+                        s["el_check_at"] = now + 3
+                    # Fallback: open gate after 15s regardless
+                    if not s["new_el_seen"] and (now - s["start"]) > 15:
                         s["new_el_seen"] = True
 
-                # Stable-text fallback (works when stop-btn selector is stale)
+                # Stable-text: only count when gate is open
                 cur_len = len(_page_text(page))
                 if s["new_el_seen"] and cur_len == s["prev_len"] and cur_len > s["pre_len"] + 80:
                     s["stable"] += 1
