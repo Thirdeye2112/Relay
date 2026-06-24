@@ -747,7 +747,14 @@ class BrowserManager:
                 _save_debug(page, ag, "batch_02_no_tab") if page else None
                 continue
             try:
-                page.bring_to_front()
+                # No bring_to_front() here -- CDP dispatches input events
+                # directly to a page's renderer regardless of which tab is
+                # visually frontmost, so switching focus across N tabs in
+                # rapid succession bought nothing functionally and was the
+                # likely cause of the reported "switching tabs is super
+                # slow and almost breaks the system": each switch forces a
+                # real Chrome window-focus change with repaint/visibility-
+                # change overhead, multiplied by every agent, every round.
                 pre_len    = len(_page_text(page))
                 pre_counts = _response_counts(page, site)
                 _type_and_submit(page, site, msg, ag)

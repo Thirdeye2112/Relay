@@ -325,6 +325,8 @@ def render_display(sid: str) -> None:
         elif ev["type"] == "synthesis":
             with st.chat_message("synthesis", avatar="🔮"):
                 st.markdown(f"**SYNTHESIS**\n\n{ev['content']}")
+        elif ev["type"] == "auto_round_marker":
+            st.caption(ev["content"])
         elif ev["type"] == "payload_dump":
             with st.expander("🔍 Payloads sent this round"):
                 for name, payload in ev["payloads"].items():
@@ -559,6 +561,39 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
             commit_async(_gh_append_round, repo, meta.get("topic", "conversation"),
                          list(active.keys()), user_msg, replies)
 
+
+_AUTO_CONTINUE_MSG = (
+    "Continue the discussion. Respond directly to what the other panelists "
+    "just said above — agree, disagree, build on it, or raise a new angle. "
+    "Keep it substantive."
+)
+
+def run_auto_rounds(sid: str, participants: dict, user_msg: str,
+                     n_rounds: int, synthesize: bool = True) -> None:
+    """Run the human's message, then N-1 further rounds automatically with
+    no further human input -- each round uses the existing cross-injection
+    mechanism (every agent sees every other agent's latest reply) the same
+    way a manually-typed round does. This is the actual point of Relay:
+    push once, let the panel go back and forth on its own.
+
+    Matches the flow the (unbuilt) Genius repo's API spec describes --
+    prompt -> simultaneous responses -> critique round(s) -> synthesis --
+    just running it over browser tabs instead of direct API calls.
+
+    Known limitation: Streamlit can't process a "stop" click while this
+    function is running (the script thread is busy until it returns), so
+    rounds are capped up front rather than offering live mid-run cancel.
+    Each round still renders its replies as they complete, same as a single
+    manual round always has -- you see progress, you just can't interrupt it.
+    """
+    run_round(sid, participants, user_msg, synthesize=synthesize)
+    for i in range(2, n_rounds + 1):
+        marker = f"🔁 Auto-continuing — round {i}/{n_rounds}"
+        st.caption(marker)
+        append_display(sid, {"type": "auto_round_marker", "content": marker})
+        run_round(sid, participants, _AUTO_CONTINUE_MSG, synthesize=synthesize)
+
+
 # ── Session state ─────────────────────────────────────────────────────────────
 
 if "active_session" not in st.session_state: st.session_state.active_session = None
@@ -692,8 +727,19 @@ if mode == "Conversations":
         if not participants:
             st.info("No browsers open yet — launch agents in the **Agents** tab, then come back and send a message.")
         else:
-            synthesize = st.toggle("🔮 Synthesizer", value=True,
-                                   help="After each round, a neutral pass summarizes agreements, tensions, and missed angles.")
+            sc1, sc2 = st.columns([3, 2])
+            with sc1:
+                synthesize = st.toggle("🔮 Synthesizer", value=True,
+                                       help="After each round, a neutral pass summarizes agreements, tensions, and missed angles.")
+            with sc2:
+                auto_rounds = st.number_input(
+                    "🔁 Auto-rounds", min_value=1, max_value=10, value=1,
+                    help="Push your message once, then let the panel go back and "
+                         "forth this many rounds with no further input from you. "
+                         "Each round costs real model usage across every tab, and "
+                         "once started this can't be cancelled mid-run -- it has to "
+                         "finish the rounds it was given.",
+                )
 
             # ── File attachment ───────────────────────────────────────────────
             uploaded = st.file_uploader(
@@ -742,7 +788,11 @@ if mode == "Conversations":
                     if file_attachment:
                         st.caption(f"📎 {file_attachment[0]}")
                     st.markdown(user_input)
-                run_round(sid, participants, full_msg, synthesize=synthesize)
+                if auto_rounds > 1:
+                    with st.spinner(f"Running {auto_rounds} rounds…"):
+                        run_auto_rounds(sid, participants, full_msg, int(auto_rounds), synthesize=synthesize)
+                else:
+                    run_round(sid, participants, full_msg, synthesize=synthesize)
                 st.rerun()
 
     else:
