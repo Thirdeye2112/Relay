@@ -550,10 +550,55 @@ if mode == "Conversations":
         else:
             synthesize = st.toggle("🔮 Synthesizer", value=True,
                                    help="After each round, a neutral pass summarizes agreements, tensions, and missed angles.")
+
+            # ── File attachment ───────────────────────────────────────────────
+            uploaded = st.file_uploader(
+                "Attach a file (content included in next message)",
+                type=["txt","md","py","js","ts","jsx","tsx","html","css","json",
+                      "yaml","yml","toml","csv","xml","sh","sql","go","rs","java",
+                      "c","cpp","h","rb","php","swift","kt","r","tex","pdf"],
+                label_visibility="collapsed",
+                key=f"upload_{sid}",
+            )
+            if uploaded:
+                try:
+                    if uploaded.type == "application/pdf":
+                        import io
+                        try:
+                            import pypdf
+                            reader = pypdf.PdfReader(io.BytesIO(uploaded.read()))
+                            file_text = "\n".join(p.extract_text() or "" for p in reader.pages)
+                        except ImportError:
+                            file_text = "[PDF attached — install pypdf to extract text: pip install pypdf]"
+                    else:
+                        file_text = uploaded.read().decode("utf-8", errors="replace")
+                    st.session_state[f"file_content_{sid}"] = (uploaded.name, file_text)
+                    st.caption(f"📎 **{uploaded.name}** ({len(file_text):,} chars) — will be included in next message")
+                except Exception as e:
+                    st.warning(f"Could not read file: {e}")
+            elif f"file_content_{sid}" in st.session_state:
+                name, _ = st.session_state[f"file_content_{sid}"]
+                col1, col2 = st.columns([6, 1])
+                with col1:
+                    st.caption(f"📎 **{name}** attached")
+                with col2:
+                    if st.button("✕", key="clear_file"):
+                        del st.session_state[f"file_content_{sid}"]
+                        st.rerun()
+
+            # ── Chat input ────────────────────────────────────────────────────
             if user_input := st.chat_input("Message all agents…"):
+                file_attachment = st.session_state.pop(f"file_content_{sid}", None)
+                if file_attachment:
+                    fname, ftext = file_attachment
+                    full_msg = f"[File: {fname}]\n```\n{ftext}\n```\n\n{user_input}" if user_input.strip() else f"[File: {fname}]\n```\n{ftext}\n```"
+                else:
+                    full_msg = user_input
                 with st.chat_message("user", avatar="🧑"):
+                    if file_attachment:
+                        st.caption(f"📎 {file_attachment[0]}")
                     st.markdown(user_input)
-                run_round(sid, participants, user_input, synthesize=synthesize)
+                run_round(sid, participants, full_msg, synthesize=synthesize)
                 st.rerun()
 
     else:
