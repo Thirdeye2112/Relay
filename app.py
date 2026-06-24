@@ -176,6 +176,16 @@ def connect_browser() -> None:
     st.session_state.browser_manager = m
     auto_assign_tabs(m)
 
+# claude.ai/code is Claude Code's IDE web view, not the chat composer --
+# "claude.ai" is a substring of that URL too, so the plain url_match check
+# below would happily hand a Claude Code tab to a chat-persona agent (e.g.
+# claude_code_architect/claude_code_pragmatist are chat personas, not meant
+# to drive the actual Claude Code product UI). None of the input selectors
+# in SITES["claude"] exist on that page, so a tab assigned there fails with
+# "Input box not found" every single time -- exclude it from auto-matching.
+def _is_excluded_tab(url: str) -> bool:
+    return "claude.ai/code" in url
+
 def auto_assign_tabs(m: "BrowserManager") -> None:
     """Scan open tabs and assign each browser agent to the first matching tab."""
     tabs = m.scan_tabs()
@@ -189,6 +199,8 @@ def auto_assign_tabs(m: "BrowserManager") -> None:
         if not site:
             continue
         for i, tab in enumerate(tabs):
+            if _is_excluded_tab(tab["url"]):
+                continue
             if site["url_match"] in tab["url"] and i not in used:
                 try:
                     m.assign_tab(name, i)
@@ -204,6 +216,8 @@ def find_tab_for_agent(m: "BrowserManager", agent_name: str) -> str | None:
     if not site:
         return None
     for i, tab in enumerate(tabs):
+        if _is_excluded_tab(tab["url"]):
+            continue
         if site["url_match"] in tab["url"]:
             try:
                 m.assign_tab(agent_name, i)
@@ -315,26 +329,86 @@ def run_synthesis(sid: str, user_msg: str, replies: dict) -> None:
 
 # ── Group round ───────────────────────────────────────────────────────────────
 
+_MAX_CROSS_CHARS = 1500  # cap each agent's reply before cross-injecting
+
+# Sentinels Relay itself produces when a browser agent's round failed --
+# a typed-but-never-sent message, a timeout, a missing tab, etc. These must
+# never be treated as a real reply: broadcasting "[Error: ...]" to every
+# other agent as if it were the failed agent's actual position corrupts
+# every subsequent round's context for the whole panel from one tab hiccup,
+# and counting it as "this agent has replied" would also wrongly skip
+# sending it the round-1 system prompt next time.
+_FAILURE_PREFIXES = ("[Error:", "[Timed out]", "[No response captured", "[Not sent")
+
+def _is_relay_failure(text: str) -> bool:
+    t = (text or "").strip()
+    return t.startswith(_FAILURE_PREFIXES)
+
+
 def _build_cross_context(sid: str, my_name: str, participants: dict) -> str:
-    """Return the last reply from every other participant, formatted for embedding."""
+    """Return the last SUCCESSFUL reply from every other participant."""
     parts = []
     for name in participants:
         if name == my_name:
             continue
         history = load_session(sid, name)
-        last = next((m.content for m in reversed(history) if m.role == "assistant"), None)
+        last = next(
+            (m.content for m in reversed(history)
+             if m.role == "assistant" and not _is_relay_failure(m.content)),
+            None,
+        )
         if last:
-            parts.append(f"[{name.upper()}]: {last}")
+            snippet = last[:_MAX_CROSS_CHARS]
+            if len(last) > _MAX_CROSS_CHARS:
+                snippet += "\n[…truncated — see full reply in browser]"
+            parts.append(f"[{name.upper()}]: {snippet}")
     if not parts:
         return ""
     return "The other panelists said:\n\n" + "\n\n".join(parts)
 
 
+def _build_browser_msg(sid: str, name: str, cfg, active: dict, user_msg: str) -> str:
+    """Build the message string to paste into a browser agent's chat box.
+
+    Must be called BEFORE the current user_msg is appended to the agent's
+    history file — is_first is determined by whether the agent has ever
+    replied, not by whether there are user messages in the file.
+
+    Round 1: send the enriched session system prompt (group identity + topic
+             framing written at session creation) so the agent knows who it
+             is and who else is in the conversation.
+    Round 2+: omit system prompt (already in browser's conversation memory);
+              send the other agents' latest replies so this agent can respond
+              to them, followed by the user's new message.
+    """
+    history  = load_session(sid, name)   # read current state, before this round's append
+    # A failed round (tab not found, send never verified, etc.) does not
+    # count as "replied" -- otherwise a round-1 failure would permanently
+    # skip sending this agent the system prompt on every later attempt.
+    is_first = not any(
+        m.role == "assistant" and not _is_relay_failure(m.content) for m in history
+    )
+
+    if is_first:
+        # Use the enriched system prompt built at session creation (stored in the
+        # session's system message) — NOT cfg.system_prompt, which is the raw yaml
+        # field and lacks the group-conversation framing ("You are in a panel with…").
+        sys_msg = next((m.content for m in history if m.role == "system"), cfg.system_prompt)
+        # The browser tab may have prior conversation history from a different session.
+        # The separator line signals a hard context break so the model doesn't answer
+        # whatever was previously in the window.
+        return (
+            "=== NEW RELAY SESSION — START FRESH, IGNORE PRIOR MESSAGES IN THIS WINDOW ===\n\n"
+            f"{sys_msg}\n\n---\n\n{user_msg}"
+        )
+
+    cross = _build_cross_context(sid, name, active)
+    return f"{cross}\n\n---\n\nUser: {user_msg}" if cross else user_msg
+
+
 def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = True) -> None:
     mgr = get_manager()
 
-    # Only act on agents that are actually reachable right now.
-    # Browser agents need a linked tab; API agents need an active key.
     def is_ready(name: str, cfg) -> bool:
         if getattr(cfg, "mode", "api") == "browser":
             return bool(mgr and mgr.has_agent(name))
@@ -345,6 +419,19 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
         st.warning("No agents are ready — link tabs in Agents or set API keys.")
         return
 
+    browser_agents = {n: c for n, c in active.items()
+                      if getattr(c, "mode", "api") == "browser"}
+    api_agents     = {n: c for n, c in active.items()
+                      if getattr(c, "mode", "api") != "browser"}
+
+    # Build browser payloads BEFORE appending the user message to state.
+    # is_first inside _build_browser_msg checks whether the agent has replied
+    # before — that check is only valid on the pre-update history.
+    payloads: dict = {}
+    for name, cfg in browser_agents.items():
+        payloads[name] = _build_browser_msg(sid, name, cfg, active, user_msg)
+
+    # Now commit the user turn to all agent histories and the display log.
     append_display(sid, {"type": "user", "content": user_msg})
     for name in active:
         append_message(sid, name, Message("user", user_msg))
@@ -352,35 +439,15 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
     replies: dict = {}
 
     # ── Browser agents — submit all at once, wait in parallel ─────────────────
-    browser_agents = {n: c for n, c in active.items()
-                      if getattr(c, "mode", "api") == "browser"}
-    api_agents     = {n: c for n, c in active.items()
-                      if getattr(c, "mode", "api") != "browser"}
+    if browser_agents and payloads and mgr:
+        agent_list = ", ".join(payloads.keys())
+        with st.spinner(f"Waiting for {agent_list}…"):
+            try:
+                batch = mgr.send_batch(payloads)
+                replies.update(batch)
+            except Exception as e:
+                st.error(f"Batch send failed: {e}")
 
-    if browser_agents:
-        payloads: dict = {}
-
-        for name, cfg in browser_agents.items():
-            history  = load_session(sid, name)
-            is_first = not any(m.role == "user" for m in history)
-            if is_first:
-                msg_to_send = f"{cfg.system_prompt}\n\n---\n\n{user_msg}"
-            else:
-                cross = _build_cross_context(sid, name, active)
-                msg_to_send = (f"{cross}\n\n---\n\nUser: {user_msg}"
-                               if cross else user_msg)
-            payloads[name] = msg_to_send
-
-        if payloads and mgr:
-            agent_list = ", ".join(payloads.keys())
-            with st.spinner(f"Waiting for {agent_list}…"):
-                try:
-                    batch = mgr.send_batch(payloads)
-                    replies.update(batch)
-                except Exception as e:
-                    st.error(f"Batch send failed: {e}")
-
-        # Display results in agent order
         for name in browser_agents:
             if name not in replies:
                 continue
@@ -398,21 +465,37 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
             except Exception as e:
                 st.error(f"**{name.upper()} failed:** {e}")
 
-    # Persist replies + cross-inject for session history
+    # ── Persist replies ────────────────────────────────────────────────────────
     for name, reply in replies.items():
         append_display(sid, {"type": "reply", "agent": name, "content": reply})
         append_message(sid, name, Message("assistant", reply))
 
+    # Cross-inject all other agents' replies as ONE bundled user message.
+    # Multiple back-to-back append_message("user") calls create consecutive
+    # user-role entries which Anthropic's API rejects (400) if any API agents
+    # are ever added to a session.
+    #
+    # Only SUCCESSFUL replies get cross-injected/synthesized -- a failed tab
+    # ("[Error: ...]", "[Timed out]", etc.) is shown to the user above so the
+    # failure is visible, but every other agent earnestly responding to a
+    # sentinel string as if it were a real position is exactly how one tab
+    # hiccup corrupts the whole panel's context for the rest of the session.
+    successful_replies = {n: r for n, r in replies.items() if not _is_relay_failure(r)}
+
     for name in active:
-        for other, reply in replies.items():
-            if other != name:
-                append_message(sid, name, Message("user", f"[{other.upper()}]: {reply}"))
+        cross_parts = [
+            f"[{other.upper()}]: {reply}"
+            for other, reply in successful_replies.items()
+            if other != name
+        ]
+        if cross_parts:
+            append_message(sid, name, Message("user", "\n\n".join(cross_parts)))
 
-    # Synthesizer pass
-    if synthesize and len(replies) > 1:
-        run_synthesis(sid, user_msg, replies)
+    # ── Synthesizer ───────────────────────────────────────────────────────────
+    if synthesize and len(successful_replies) > 1:
+        run_synthesis(sid, user_msg, successful_replies)
 
-    # Commit to GitHub (background)
+    # ── GitHub (background) ───────────────────────────────────────────────────
     if replies:
         repo = get_github_repo()
         if repo:
@@ -508,11 +591,15 @@ if mode == "Conversations":
             for name, cfg in agents_cfg.items():
                 others = [n for n in all_names if n != name]
                 sys_prompt = (
-                    f"You are {name.upper()}. You are in a group conversation with "
-                    f"{', '.join(o.upper() for o in others)}.\n"
+                    f"You are {name.upper()}. You are in a multi-agent relay conversation "
+                    f"with {', '.join(o.upper() for o in others)}.\n"
                     f"Topic: {topic.strip()}\n\n"
-                    f"Others' messages appear as [NAME]: ...\n"
-                    f"Engage directly. Be concise and substantive.\n\n"
+                    f"HOW THE RELAY WORKS:\n"
+                    f"- Each round you receive the other agents' latest replies tagged as [NAME]: their message\n"
+                    f"- You must read those tagged messages and respond to them directly — they are real\n"
+                    f"  replies from the other agents, not placeholders\n"
+                    f"- Your reply is then forwarded to all other agents before the next round\n"
+                    f"- Write ONE response per round. Do not simulate other agents or produce multiple turns.\n\n"
                 ) + cfg.system_prompt
                 append_message(sid, name, Message("system", sys_prompt))
             st.session_state.active_session = sid

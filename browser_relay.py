@@ -60,6 +60,13 @@ SITES: dict[str, dict] = {
         ],
         "stop_btn":     'button[aria-label="Stop response"]',
         "send_btn":     'button[aria-label="Send message"]',
+        # Gemini's model-response/message-content are Angular custom elements
+        # that may use Shadow DOM. Playwright's css engine pierces OPEN shadow
+        # roots automatically already (no special ">>"" syntax needed for
+        # that case); if these still return empty, the shadow root is CLOSED
+        # and no selector syntax can reach inside it -- that needs verifying
+        # against the live DOM (inspect model-response, check shadowRoot.mode)
+        # before any selector-based fix would actually help.
         "response_sel": [
             "model-response .markdown",
             "message-content .markdown",
@@ -116,7 +123,7 @@ def site_for_agent(agent_name: str) -> Optional[dict]:
 
 # ── Page helpers ────────────────────────────────────────────────────────────────
 
-def _resolve_selector(page, selectors, timeout: int = 8000):
+def _resolve_selector(page, selectors, timeout: int = 1500, prefer_latest: bool = True):
     """Resolve to a single, VISIBLE matching element.
 
     Hidden/decoy duplicates (legacy SEO textareas, off-screen mobile
@@ -124,6 +131,13 @@ def _resolve_selector(page, selectors, timeout: int = 8000):
     into it is indistinguishable from doing nothing, which is exactly
     what broke Perplexity's input. Returns the element itself (already
     resolved), not a multi-match Locator -- callers no longer need `.last`.
+
+    timeout defaults to 1500ms (was 8000ms): with 4-5 fallback selectors
+    per site, a genuinely missing element used to mean up to ~32-40s before
+    giving up -- the first match usually appears fast if it's going to
+    appear at all. prefer_latest controls scan direction (latest-first vs
+    first-first) for sites where the wrong-but-matching element sits at the
+    other end of the DOM order; default keeps existing behavior.
     """
     if isinstance(selectors, str):
         selectors = [selectors]
@@ -132,7 +146,8 @@ def _resolve_selector(page, selectors, timeout: int = 8000):
             page.wait_for_selector(sel, timeout=timeout)
             loc = page.locator(sel)
             n = loc.count()
-            for i in range(n - 1, -1, -1):
+            ordering = range(n - 1, -1, -1) if prefer_latest else range(n)
+            for i in ordering:
                 candidate = loc.nth(i)
                 try:
                     if candidate.is_visible():
@@ -142,6 +157,32 @@ def _resolve_selector(page, selectors, timeout: int = 8000):
         except Exception:
             continue
     return None
+
+
+def _force_input_events(page) -> None:
+    """Dispatch a real InputEvent + change on the focused element.
+
+    Clipboard paste populates the visible DOM but framework-controlled
+    editors (ProseMirror, Lexical, Gemini's rich-textarea) derive the send
+    button's enabled state from their internal document model, which only
+    updates on a real input/beforeinput transaction -- a raw Ctrl+V doesn't
+    always fire one. Without this, the send button stays disabled, Tier 1
+    is skipped, and the JS fallback clicks whatever other button happens to
+    be enabled (attach/mic/tools) instead -- the root cause of "typed but
+    never sent."
+    """
+    try:
+        page.evaluate("""() => {
+            const el = document.activeElement;
+            if (!el) return;
+            el.dispatchEvent(new InputEvent('input', {
+                bubbles: true, inputType: 'insertFromPaste',
+                data: el.innerText || el.value || '',
+            }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        }""")
+    except Exception:
+        pass
 
 
 def _clipboard_insert(page, message: str) -> bool:
@@ -163,9 +204,47 @@ def _clipboard_insert(page, message: str) -> bool:
         page.keyboard.press("Control+a")
         time.sleep(0.05)  # let selection register before paste
         page.keyboard.press("Control+v")
+        time.sleep(0.15)  # let the paste land in the DOM before nudging the framework
+        _force_input_events(page)
         return True
     except Exception:
         return False
+
+
+def _did_clear(el) -> bool:
+    """True if the composer is now empty -- the universal "it actually sent" signal."""
+    try:
+        return not (el.evaluate("e => (e.innerText || e.value || '').trim()"))
+    except Exception:
+        return False
+
+
+def _verify_sent(page, site: dict, el, pre_counts: dict, timeout: float = 2.5) -> bool:
+    """Fast post-submit check: did the composer clear, a stop button appear,
+    or a new response element show up? This is deliberately short (~2.5s),
+    distinct from _wait_and_read's long poll -- its job is letting
+    _type_and_submit detect a no-op click (wrong/disabled button) and retry
+    the next tier, not to wait out the model's actual response.
+    """
+    deadline = time.time() + timeout
+    stop_sel = site.get("stop_btn")
+    while time.time() < deadline:
+        if _did_clear(el):
+            return True
+        if stop_sel:
+            try:
+                if page.locator(stop_sel).count() > 0:
+                    return True
+            except Exception:
+                pass
+        try:
+            cur_counts = _response_counts(page, site)
+            if any(cur_counts.get(sel, 0) > n for sel, n in pre_counts.items()):
+                return True
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return False
 
 
 def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
@@ -179,9 +258,10 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
     el.click()
     time.sleep(0.1)   # let focus settle before detecting element type
     tag = el.evaluate("el => el.tagName.toLowerCase()")
-    is_lexical = el.evaluate(
-        "el => el.hasAttribute('data-lexical-editor') || el.getAttribute('role') === 'textbox'"
-    )
+    # Narrowed to the actual Lexical attribute -- role="textbox" matches any
+    # ARIA textbox (including plain contenteditable divs on non-Lexical
+    # sites), which wrongly picked the newline-flattening fallback for them.
+    is_lexical = el.evaluate("el => el.hasAttribute('data-lexical-editor')")
 
     if tag in ("textarea", "input"):
         # Native fill triggers React state correctly
@@ -193,7 +273,8 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
         # execCommand('insertText') is deprecated in Chrome 90+ and silently drops
         # text in ProseMirror on current Chrome. keyboard.type() fires real Enter
         # events on every \n, submitting Lexical forms mid-message.
-        # Clipboard paste avoids both problems.
+        # Clipboard paste avoids both problems. _clipboard_insert already fires
+        # the input/change nudge internally; the fallback paths below need it too.
         if not _clipboard_insert(page, message):
             if is_lexical:
                 # Lexical fallback: type without newlines to avoid premature submit
@@ -206,27 +287,56 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
                     "document.execCommand('insertText', false, text); }",
                     message,
                 )
+            _force_input_events(page)
     time.sleep(0.5)
+    _save_debug(page, agent, "02_after_paste")
 
+    pre_counts = _response_counts(page, site)
     submitted = False
+
+    # Tier 1: configured send button. POLL for it to become enabled (up to
+    # ~2s) instead of checking once -- large pastes take the framework a
+    # moment to re-render and enable the button, and a single early check
+    # was the original failure: it saw "disabled" and gave up immediately.
     send_sel = site.get("send_btn")
     if send_sel:
         try:
             btn = page.locator(send_sel)
             btn.first.wait_for(state="visible", timeout=3000)
-            if btn.count() > 0 and btn.first.is_enabled():
-                btn.first.click()
-                submitted = True
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                if btn.count() > 0 and btn.first.is_enabled():
+                    btn.first.click()
+                    submitted = True
+                    break
+                time.sleep(0.2)
         except Exception:
             pass
+        if submitted:
+            _save_debug(page, agent, "03_after_send_click")
+            if not _verify_sent(page, site, el, pre_counts):
+                submitted = False  # click was a no-op -- composer never cleared
+
+    # Tier 2: JS fallback. Must filter for actual send/submit semantics and
+    # take the LAST match, not the first enabled+visible button found in DOM
+    # order -- in every composer here the real send control is the last one
+    # and starts disabled, so "first enabled button" was reliably the
+    # attach/mic/tools control instead, clicking it and reporting success.
     if not submitted:
-        # Find the submit button closest to the focused input, then fall back globally.
         try:
             clicked = page.evaluate("""() => {
+                function isSend(b) {
+                    const s = ((b.getAttribute('aria-label')||'') + ' ' +
+                               (b.getAttribute('data-testid')||'') + ' ' +
+                               (b.textContent||'')).toLowerCase();
+                    return /send|submit|^ask$/.test(s) &&
+                           !/attach|file|mic|voice|dictate|tool|model|stop/.test(s);
+                }
                 function tryClick(root) {
                     const btns = [...(root ? root.querySelectorAll('button') :
                                               document.querySelectorAll('button'))];
-                    const b = btns.find(b => !b.disabled && b.offsetParent !== null);
+                    const sends = btns.filter(b => !b.disabled && b.offsetParent !== null && isSend(b));
+                    const b = sends[sends.length - 1];
                     if (b) { b.click(); return true; }
                     return false;
                 }
@@ -235,24 +345,42 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
                 const composer = active &&
                     (active.closest('form') ||
                      active.closest('[class*="composer"]') ||
-                     active.closest('[class*="input"]'));
+                     active.closest('[class*="input"]') ||
+                     active.closest('[data-testid*="composer"]') ||
+                     active.closest('[data-testid*="input"]'));
                 if (composer && tryClick(composer)) return true;
-                // 2. Labelled send/submit/ask buttons anywhere
-                const labels = ['submit','send','ask'];
-                for (const b of document.querySelectorAll('button')) {
-                    const lbl = (b.getAttribute('aria-label') || b.textContent || '').toLowerCase();
-                    if (labels.some(l => lbl.includes(l)) && !b.disabled && b.offsetParent !== null) {
-                        b.click(); return true;
-                    }
-                }
-                return false;
+                // 2. Anywhere on the page
+                return tryClick(null);
             }""")
             if clicked:
                 submitted = True
         except Exception:
             pass
+        if submitted:
+            _save_debug(page, agent, "03_after_send_click")
+            if not _verify_sent(page, site, el, pre_counts):
+                submitted = False
+
+    # Tier 3: keyboard submit chords, each verified before trying the next --
+    # a chord that just inserts a newline (wrong gesture for this site) must
+    # not be allowed to masquerade as a successful send.
     if not submitted:
-        el.press("Enter")
+        for chord in ("Enter", "Control+Enter", "Meta+Enter"):
+            try:
+                el.click()
+                el.press(chord)
+            except Exception:
+                continue
+            if _verify_sent(page, site, el, pre_counts, timeout=1.5):
+                submitted = True
+                break
+
+    if not submitted:
+        _save_debug(page, agent, "04_send_not_verified")
+        raise RuntimeError(
+            "Message pasted but send did not trigger — composer never cleared "
+            "and no new response/stop indicator appeared after all submit attempts."
+        )
 
 
 def _page_text(page) -> str:
@@ -328,6 +456,15 @@ def _wait_and_read(page, site: dict, timeout: int, pre_len: int = 0,
                 page.wait_for_selector(stop_sel, state="hidden", timeout=timeout * 1000)
             except Exception:
                 pass
+            # Fast path: if the response selectors still match (the common
+            # case), we're done. If they're stale (a UI redesign moved the
+            # class names), don't jump straight to the unreliable raw
+            # page-text diff below -- fall through into the SAME element-
+            # count/stability logic used when no stop button matched at all.
+            resp = _read_last_response(page, site)
+            if resp:
+                return resp
+            appeared = False
 
     if not appeared:
         deadline = time.time() + timeout
@@ -377,28 +514,29 @@ def _wait_and_read(page, site: dict, timeout: int, pre_len: int = 0,
     return "[No response captured — check the browser window]"
 
 
-_UI_CHROME = [
-    # Claude footer / attribution
+# Long, specific phrases -- safe to substring-match since they're full
+# sentences a genuine model response is very unlikely to contain verbatim.
+_UI_CHROME_PHRASES = [
     "Claude is AI and can make mistakes",
     "Please double-check responses",
-    "Sonnet", "Opus", "Haiku",
     "Want to be notified when Claude responds",
     "Claude responded:",
-    # Gemini footer
     "Gemini is AI and can make mistakes",
     "Keep in mind Gemini",
     "Chats are reviewed",
     "Use microphone",
-    "Google AI",
     "Terms and Privacy",
-    # Perplexity / ChatGPT
     "ChatGPT can make mistakes",
     "Always verify important information",
-    "Copy",
-    "Share",
-    "Notify",
-    "New conversation",
 ]
+
+# Short, generic button/label words -- substring matching against these
+# silently dropped any real response line that happened to contain the word
+# (e.g. "Copy this snippet", "Share the dataset"). Exact whole-line match only.
+_UI_CHROME_EXACT = {s.lower() for s in [
+    "Copy", "Share", "Notify", "New conversation",
+    "Sonnet", "Opus", "Haiku", "Google AI",
+]}
 
 def _clean_diff(text: str) -> str:
     """Strip UI chrome from a page-text diff and return the response content."""
@@ -406,7 +544,9 @@ def _clean_diff(text: str) -> str:
     clean = []
     for line in lines:
         stripped = line.strip()
-        if any(pat in stripped for pat in _UI_CHROME):
+        if stripped.lower() in _UI_CHROME_EXACT:
+            continue
+        if any(pat in stripped for pat in _UI_CHROME_PHRASES):
             continue
         clean.append(line)
     # Drop leading/trailing blank lines and return
@@ -596,6 +736,7 @@ class BrowserManager:
             site = site_for_agent(ag)
             if page is None or page.is_closed() or site is None:
                 state[ag] = {"error": "No tab assigned or unknown site"}
+                _save_debug(page, ag, "batch_02_no_tab") if page else None
                 continue
             try:
                 page.bring_to_front()
@@ -613,6 +754,7 @@ class BrowserManager:
                 }
             except Exception as e:
                 state[ag] = {"error": str(e)}
+                _save_debug(page, ag, "batch_02_type_error")
 
         results = {a: f"[Error: {s['error']}]" for a, s in state.items() if "error" in s}
         pending  = [a for a in state if "error" not in state[a]]
@@ -626,12 +768,18 @@ class BrowserManager:
                 s = state[ag]
                 page, site = s["page"], s["site"]
 
+                # ── Deadline: try selector extraction before falling back to raw diff
                 if time.time() > s["deadline"]:
-                    cur = _page_text(page)
-                    results[ag] = cur[s["pre_len"]:].strip() or "[Timed out]"
+                    resp = _read_last_response(page, site)
+                    if not resp:
+                        cur  = _page_text(page)
+                        diff = cur[s["pre_len"]:].strip()
+                        resp = _clean_diff(diff) if diff else ""
+                    results[ag] = resp or "[Timed out]"
+                    _save_debug(page, ag, "batch_05_timeout")
                     continue
 
-                # Stop-button (cheapest: single locator count call)
+                # ── Stop-button (cheapest: single locator count call)
                 stop_sel = site.get("stop_btn")
                 stop_now = False
                 if stop_sel:
@@ -644,13 +792,15 @@ class BrowserManager:
                     if s["stop_seen"] and not stop_now:
                         resp = _read_last_response(page, site)
                         if not resp:
-                            resp = _page_text(page)[s["pre_len"]:].strip()
+                            resp = _clean_diff(_page_text(page)[s["pre_len"]:].strip())
                         results[ag] = resp or "[No response captured]"
                         continue
 
-                # Element-count gate — only poll every 3s to keep overhead low.
-                # After 15s without a new element (selector drift), open the gate
-                # anyway so stable-text can fire rather than waiting for timeout.
+                # ── Element-count gate — poll every 3s, no blind time fallback.
+                # The single-send fix (707ef5e) waits for element count to actually
+                # increase before the stability check starts.  Mirroring that here:
+                # a longer blind timeout treats the symptom; removing it fixes the
+                # cause — if no new element appears, there is no valid response yet.
                 if not s["new_el_seen"]:
                     now = time.time()
                     if now >= s["el_check_at"]:
@@ -658,21 +808,25 @@ class BrowserManager:
                         if any(cur_counts.get(sel, 0) > n
                                for sel, n in s["pre_counts"].items()):
                             s["new_el_seen"] = True
-                        s["el_check_at"] = now + 3
-                    # Fallback: open gate after 15s regardless
-                    if not s["new_el_seen"] and (now - s["start"]) > 15:
-                        s["new_el_seen"] = True
+                        else:
+                            s["el_check_at"] = now + 3
+                    still.append(ag)
+                    s["prev_len"] = len(_page_text(page))
+                    continue
 
-                # Stable-text: only count when gate is open
+                # ── Stable-text: only fires once element gate is open
                 cur_len = len(_page_text(page))
-                if s["new_el_seen"] and cur_len == s["prev_len"] and cur_len > s["pre_len"] + 80:
+                if cur_len == s["prev_len"] and cur_len > s["pre_len"] + 80:
                     s["stable"] += 1
                     if s["stable"] >= 4:
-                        cur  = _page_text(page)
                         resp = _read_last_response(page, site)
                         if not resp:
-                            resp = cur[s["pre_len"]:].strip()
-                        results[ag] = resp or "[No response captured]"
+                            resp = _clean_diff(_page_text(page)[s["pre_len"]:].strip())
+                        if resp:
+                            results[ag] = resp
+                        else:
+                            results[ag] = "[No response captured]"
+                            _save_debug(page, ag, "batch_04_no_response")
                         continue
                 else:
                     s["stable"] = 0
