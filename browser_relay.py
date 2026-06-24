@@ -470,8 +470,8 @@ def _wait_and_read(page, site: dict, timeout: int, pre_len: int = 0,
         deadline = time.time() + timeout
 
         # Wait for a NEW response element before checking stability at all.
+        new_el_seen = False
         if pre_counts:
-            new_el_seen = False
             while time.time() < deadline:
                 cur_counts = _response_counts(page, site)
                 if any(cur_counts.get(sel, 0) > n for sel, n in pre_counts.items()):
@@ -482,12 +482,20 @@ def _wait_and_read(page, site: dict, timeout: int, pre_len: int = 0,
                 _save_debug(page, agent, "03_no_new_element_appeared")
 
         # Now check page-text stability (skips the thinking-pause window above).
+        # The +80 floor only matters BEFORE new_el_seen, to rule out the user's
+        # own echoed message satisfying stability during the thinking pause.
+        # Once the element-count gate already proved a genuine new response
+        # exists, requiring another +80 chars of growth on top of that was
+        # wrong: short replies (handshake-style "Confirmed.", "[NAME] online.")
+        # never reach it and always burn the full timeout despite having
+        # finished immediately. Drop the floor to a tiny margin once gated.
         time.sleep(1)
+        floor = pre_len + 80 if not new_el_seen else len(_page_text(page)) - 8
         prev_len = len(_page_text(page))
         stable = 0
         while time.time() < deadline:
             cur_len = len(_page_text(page))
-            if cur_len == prev_len and cur_len > pre_len + 80:
+            if cur_len == prev_len and cur_len > floor:
                 stable += 1
                 if stable >= 3:
                     break
@@ -808,6 +816,14 @@ class BrowserManager:
                         if any(cur_counts.get(sel, 0) > n
                                for sel, n in s["pre_counts"].items()):
                             s["new_el_seen"] = True
+                            # Floor for the stable-text check below: once the
+                            # element gate is open we already know real content
+                            # exists, so only require it to stop growing -- not
+                            # another +80 chars on top, which short handshake-
+                            # style replies ("Confirmed.", "[NAME] online.")
+                            # never reach and would otherwise burn the full
+                            # timeout despite having finished immediately.
+                            s["stable_floor"] = len(_page_text(page)) - 8
                         else:
                             s["el_check_at"] = now + 3
                     still.append(ag)
@@ -816,7 +832,7 @@ class BrowserManager:
 
                 # ── Stable-text: only fires once element gate is open
                 cur_len = len(_page_text(page))
-                if cur_len == s["prev_len"] and cur_len > s["pre_len"] + 80:
+                if cur_len == s["prev_len"] and cur_len > s["stable_floor"]:
                     s["stable"] += 1
                     if s["stable"] >= 4:
                         resp = _read_last_response(page, site)

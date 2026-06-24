@@ -121,6 +121,27 @@ def save_agents(agents: dict) -> None:
 
 # ── Streaming ─────────────────────────────────────────────────────────────────
 
+def _merge_consecutive_roles(msgs: list[dict]) -> list[dict]:
+    """Collapse consecutive same-role entries into one.
+
+    The cross-inject step appends a "user" message at the end of every round
+    (the other agents' replies); the next round then appends ANOTHER "user"
+    message (the new user input) before this agent ever gets to reply --
+    two consecutive "user" entries in a row. Anthropic's Messages API
+    requires strict user/assistant alternation and rejects this with a 400.
+    Merging is a defensive normalization right at the API boundary rather
+    than changing the round/storage logic, so it's robust regardless of
+    which code path produced the consecutive entries.
+    """
+    merged: list[dict] = []
+    for m in msgs:
+        if merged and merged[-1]["role"] == m["role"]:
+            merged[-1]["content"] = merged[-1]["content"] + "\n\n" + m["content"]
+        else:
+            merged.append({"role": m["role"], "content": m["content"]})
+    return merged
+
+
 def _stream_anthropic(model: str, messages: list[Message]):
     import anthropic
     key = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -128,7 +149,9 @@ def _stream_anthropic(model: str, messages: list[Message]):
         st.error("ANTHROPIC_API_KEY not set — add it in Settings."); st.stop()
     client   = anthropic.Anthropic(api_key=key)
     system   = next((m.content for m in messages if m.role == "system"), "")
-    api_msgs = [{"role": m.role, "content": m.content} for m in messages if m.role != "system"]
+    api_msgs = _merge_consecutive_roles(
+        [{"role": m.role, "content": m.content} for m in messages if m.role != "system"]
+    )
     with client.messages.stream(model=model, max_tokens=2048, system=system, messages=api_msgs) as s:
         for chunk in s.text_stream:
             yield chunk
@@ -140,7 +163,9 @@ def _stream_openai(model: str, messages: list[Message]):
         st.error("OPENAI_API_KEY not set — add it in Settings."); st.stop()
     stream = OpenAI(api_key=key).chat.completions.create(
         model=model,
-        messages=[{"role": m.role, "content": m.content} for m in messages],
+        messages=_merge_consecutive_roles(
+            [{"role": m.role, "content": m.content} for m in messages]
+        ),
         max_tokens=2048, stream=True,
     )
     for chunk in stream:
