@@ -164,10 +164,18 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
         el.dispatch_event("input")
         el.dispatch_event("change")
     elif is_lexical:
-        # Lexical ignores execCommand — it only tracks real keyboard events.
-        # Select-all then type the whole message (no delay → fast even for long msgs).
-        page.keyboard.press("Control+a")
-        page.keyboard.type(message)
+        # keyboard.type() fires a real Enter event on every \n, which submits
+        # the Perplexity form mid-message. Use clipboard paste instead: the
+        # whole text lands at once with no synthetic key events.
+        # navigator.clipboard.writeText() is available in CDP-attached Chrome.
+        try:
+            page.evaluate("async t => await navigator.clipboard.writeText(t)", message)
+            page.keyboard.press("Control+a")
+            page.keyboard.press("Control+v")
+        except Exception:
+            # Fallback: type with newlines replaced by spaces (still avoids Enter)
+            page.keyboard.press("Control+a")
+            page.keyboard.type(message.replace("\n", " "))
     else:
         # ProseMirror and similar: execCommand is the reliable path
         page.evaluate(
@@ -335,15 +343,53 @@ def _wait_and_read(page, site: dict, timeout: int, pre_len: int = 0,
     if resp:
         return resp
 
-    # 2. Page-text diff: return everything new since before we typed.
+    # 2. Page-text diff: everything new since before we typed, cleaned of UI chrome.
     if pre_len > 0:
         full = _page_text(page)
         new_text = full[pre_len:].strip()
         if new_text:
-            return new_text
+            return _clean_diff(new_text)
 
     _save_debug(page, agent, "04_no_response_captured")
     return "[No response captured — check the browser window]"
+
+
+_UI_CHROME = [
+    # Claude footer / attribution
+    "Claude is AI and can make mistakes",
+    "Please double-check responses",
+    "Sonnet", "Opus", "Haiku",
+    "Want to be notified when Claude responds",
+    "Claude responded:",
+    # Gemini footer
+    "Gemini is AI and can make mistakes",
+    "Keep in mind Gemini",
+    "Chats are reviewed",
+    "Use microphone",
+    "Google AI",
+    "Terms and Privacy",
+    # Perplexity / ChatGPT
+    "ChatGPT can make mistakes",
+    "Always verify important information",
+    "Copy",
+    "Share",
+    "Notify",
+    "New conversation",
+]
+
+def _clean_diff(text: str) -> str:
+    """Strip UI chrome from a page-text diff and return the response content."""
+    lines = text.splitlines()
+    clean = []
+    for line in lines:
+        stripped = line.strip()
+        if any(pat in stripped for pat in _UI_CHROME):
+            continue
+        clean.append(line)
+    # Drop leading/trailing blank lines and return
+    result = "\n".join(clean).strip()
+    # If everything was stripped (very short response), return original
+    return result if result else text.strip()
 
 
 def _read_last_response(page, site: dict) -> str:
