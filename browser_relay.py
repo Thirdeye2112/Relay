@@ -191,7 +191,7 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
     if not submitted:
         # Plain Enter works for most chat UIs (both contenteditable and textarea).
         # Control+Return is NOT used — it adds a newline in Perplexity/Slack-style boxes.
-        el.press("Return")
+        el.press("Enter")
 
 
 def _page_text(page) -> str:
@@ -302,15 +302,14 @@ def _wait_and_read(page, site: dict, timeout: int, pre_len: int = 0,
 
     # 1. Try specific CSS selectors (fast, precise when selectors are current)
     resp = _read_last_response(page, site)
-    if resp and len(resp) > 50:
+    if resp:
         return resp
 
     # 2. Page-text diff: return everything new since before we typed.
-    #    Includes the echoed user message at the top, but that's acceptable.
     if pre_len > 0:
         full = _page_text(page)
         new_text = full[pre_len:].strip()
-        if len(new_text) > 50:
+        if new_text:
             return new_text
 
     _save_debug(page, agent, "04_no_response_captured")
@@ -326,7 +325,7 @@ def _read_last_response(page, site: dict) -> str:
             elements = page.locator(sel).all()
             if elements:
                 text = elements[-1].inner_text().strip()
-                if text and len(text) > 20:
+                if text:  # any non-empty text from a specific selector is valid
                     return text
         except Exception:
             continue
@@ -519,8 +518,9 @@ class BrowserManager:
         results = {a: f"[Error: {s['error']}]" for a, s in state.items() if "error" in s}
         pending  = [a for a in state if "error" not in state[a]]
 
-        # Step 2: round-robin poll until every agent has replied
-        time.sleep(2)
+        # Step 2: round-robin poll until every agent has replied.
+        # No initial sleep — check immediately so we don't miss a fast stop-button
+        # that appears and disappears while we're sleeping.
         while pending:
             still = []
             for ag in pending:
@@ -544,7 +544,7 @@ class BrowserManager:
                         s["stop_seen"] = True
                     if s["stop_seen"] and not stop_now:
                         resp = _read_last_response(page, site)
-                        if not resp or len(resp) < 50:
+                        if not resp:
                             resp = _page_text(page)[s["pre_len"]:].strip()
                         results[ag] = resp or "[No response captured]"
                         continue
@@ -571,7 +571,7 @@ class BrowserManager:
                     if s["stable"] >= 4:
                         cur  = _page_text(page)
                         resp = _read_last_response(page, site)
-                        if not resp or len(resp) < 50:
+                        if not resp:
                             resp = cur[s["pre_len"]:].strip()
                         results[ag] = resp or "[No response captured]"
                         continue
