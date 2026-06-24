@@ -140,7 +140,7 @@ _CLIENTS: dict = {}
 
 def _get_openai_client(api_key: str, base_url: str | None):
     from openai import OpenAI
-    key = (api_key[:8], base_url)
+    key = (hash(api_key), base_url)
     if key not in _CLIENTS:
         kwargs: dict = {"api_key": api_key, "timeout": 60.0, "max_retries": 2}
         if base_url:
@@ -206,6 +206,12 @@ def call_agent(agent: AgentConfig, messages: list[Message]) -> str:
         return call_anthropic(agent.model, messages)
     if agent.provider in ("openai", "perplexity"):
         return call_openai_compatible(agent, messages)
+    if agent.provider == "browser":
+        sys.exit(
+            f"Agent '{agent.name}' is configured as provider: browser.\n"
+            "Browser agents run through the Streamlit app (streamlit run app.py), not this CLI.\n"
+            "To use this CLI, set provider: anthropic / openai / perplexity in agents.yaml."
+        )
     sys.exit(
         f"Unknown provider '{agent.provider}' -- must be anthropic, openai, or perplexity"
     )
@@ -286,12 +292,16 @@ def cmd_debate(args, agents: dict[str, AgentConfig]) -> None:
     append_message(session_id, a_name, Message("system", build_system(agent_a, b_name, topic)))
     append_message(session_id, b_name, Message("system", build_system(agent_b, a_name, topic)))
 
-    # Seed A with the opening prompt; B gets it on first turn (after seeing A's reply)
+    # Both agents see the opening prompt before any cross-injection happens.
+    # B must receive it here — not after A's reply — or B's history starts with
+    # two consecutive user-role messages (A's injected reply then the topic),
+    # which violates Anthropic's strict user/assistant alternation requirement.
     opening = f'Topic: "{topic}"\n\nGive your opening position.'
     append_message(session_id, a_name, Message("user", opening))
+    append_message(session_id, b_name, Message("user", opening))
 
     banner(session_id, topic, a_name, b_name, rounds)
-    _run_rounds(session_id, agent_a, agent_b, a_name, b_name, meta, rounds, first_round=True)
+    _run_rounds(session_id, agent_a, agent_b, a_name, b_name, meta, rounds)
 
 # -- resume command ------------------------------------------------------------
 
@@ -327,7 +337,6 @@ def _run_rounds(
     b_name:     str,
     meta:       dict,
     rounds:     int,
-    first_round: bool = False,
 ) -> None:
     start = meta["rounds_completed"] + 1
 
@@ -340,15 +349,9 @@ def _run_rounds(
         print(f"\n  [{a_name.upper()} thinking...]")
         reply_a = safe_call_agent(agent_a, trim_context(load_session(session_id, a_name)))
         append_message(session_id, a_name, Message("assistant", reply_a))
-        # Cross-inject A's reply into B's context
+        # Cross-inject A's reply into B's context (B already has the opening prompt
+        # from cmd_debate, so this lands in chronological order after it)
         append_message(session_id, b_name, Message("user", f"[{a_name.upper()}]: {reply_a}"))
-
-        # If this is the very first round, give B the opening prompt before it replies
-        if first_round and r == start:
-            opening = f'Topic: "{meta["topic"]}"\n\nGive your opening position.'
-            if not any(m.role == "user" for m in load_session(session_id, b_name)
-                       if not m.content.startswith(f"[{a_name.upper()}]")):
-                append_message(session_id, b_name, Message("user", opening))
 
         print_reply(a_name, reply_a)
 
@@ -486,7 +489,6 @@ def cmd_show(args, agents: dict[str, AgentConfig]) -> None:
             if msg.role == "assistant":
                 print(f"[{agent_name.upper()}]\n{msg.content}\n")
             elif msg.role == "user":
-                prefix = f"[{next(n.upper() for n in meta['agents'] if n != agent_name)}]"
                 if msg.content.startswith("["):
                     print(f"{msg.content}\n")
                 else:

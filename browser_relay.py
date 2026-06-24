@@ -144,6 +144,30 @@ def _resolve_selector(page, selectors, timeout: int = 8000):
     return None
 
 
+def _clipboard_insert(page, message: str) -> bool:
+    """Write message to OS clipboard then paste into the focused element.
+
+    execCommand('insertText') is deprecated in recent Chrome and silently fails
+    for ProseMirror editors. Clipboard paste works universally: the whole text
+    lands in one event with no per-character key events and no newline-as-Enter
+    risk.  Returns True on success.
+    """
+    try:
+        # Grant clipboard-write permission for this origin — harmless if already set.
+        try:
+            page.context.grant_permissions(["clipboard-write"])
+        except Exception:
+            pass
+        page.evaluate("async t => { await navigator.clipboard.writeText(t); }", message)
+        time.sleep(0.1)   # let the async write settle
+        page.keyboard.press("Control+a")
+        time.sleep(0.05)  # let selection register before paste
+        page.keyboard.press("Control+v")
+        return True
+    except Exception:
+        return False
+
+
 def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
     el = _resolve_selector(page, site["input"])
     if el is None:
@@ -153,6 +177,7 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
         )
     _save_debug(page, agent, "01_before_type")
     el.click()
+    time.sleep(0.1)   # let focus settle before detecting element type
     tag = el.evaluate("el => el.tagName.toLowerCase()")
     is_lexical = el.evaluate(
         "el => el.hasAttribute('data-lexical-editor') || el.getAttribute('role') === 'textbox'"
@@ -163,26 +188,24 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
         el.fill(message)
         el.dispatch_event("input")
         el.dispatch_event("change")
-    elif is_lexical:
-        # keyboard.type() fires a real Enter event on every \n, which submits
-        # the Perplexity form mid-message. Use clipboard paste instead: the
-        # whole text lands at once with no synthetic key events.
-        # navigator.clipboard.writeText() is available in CDP-attached Chrome.
-        try:
-            page.evaluate("async t => await navigator.clipboard.writeText(t)", message)
-            page.keyboard.press("Control+a")
-            page.keyboard.press("Control+v")
-        except Exception:
-            # Fallback: type with newlines replaced by spaces (still avoids Enter)
-            page.keyboard.press("Control+a")
-            page.keyboard.type(message.replace("\n", " "))
     else:
-        # ProseMirror and similar: execCommand is the reliable path
-        page.evaluate(
-            "text => { document.execCommand('selectAll'); "
-            "document.execCommand('insertText', false, text); }",
-            message,
-        )
+        # For all contenteditable (Lexical, ProseMirror, etc.) use clipboard paste.
+        # execCommand('insertText') is deprecated in Chrome 90+ and silently drops
+        # text in ProseMirror on current Chrome. keyboard.type() fires real Enter
+        # events on every \n, submitting Lexical forms mid-message.
+        # Clipboard paste avoids both problems.
+        if not _clipboard_insert(page, message):
+            if is_lexical:
+                # Lexical fallback: type without newlines to avoid premature submit
+                page.keyboard.press("Control+a")
+                page.keyboard.type(message.replace("\n", " "))
+            else:
+                # ProseMirror fallback: execCommand (deprecated but may still work)
+                page.evaluate(
+                    "text => { document.execCommand('selectAll'); "
+                    "document.execCommand('insertText', false, text); }",
+                    message,
+                )
     time.sleep(0.5)
 
     submitted = False
