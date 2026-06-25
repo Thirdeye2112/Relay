@@ -63,6 +63,13 @@ accordingly. They were never meant to be mixed within one session.
    wait ends up close to the slowest agent, not the sum of all of them, but
    the mechanism is round-robin polling, not multi-threaded browser control
    — Relay never runs concurrent Playwright calls against one connection.
+   Text insertion tries Playwright's own `keyboard.insert_text()` first (a
+   real `input` event, no OS clipboard) and falls back to clipboard paste
+   only if that doesn't register. Submit-tier verification deadlines run in
+   `fast_mode` for batch sends specifically: one agent stuck cycling through
+   all three submit tiers at full (single-send) patience would otherwise
+   block every later agent in this sequential loop from even starting to
+   type, since they can't be submitted in parallel.
 4. Every reply comes back wrapped in a lineage envelope (`validated`,
    `capture_method`, element-count bookkeeping). Completion and submission
    detection are checkpoint-based and best-effort, not instantaneous or
@@ -82,7 +89,13 @@ accordingly. They were never meant to be mixed within one session.
 5. Only successful replies get cross-injected and fed to the synthesizer.
    Synthesis prefers reusing one of the round's already-replying browser
    agents (no extra API key/cost); falls back to a direct Anthropic API call
-   only for all-API-mode sessions with a funded key.
+   only for all-API-mode sessions with a funded key. `send_message()` (the
+   single-agent send the synthesizer and health checks use) returns the
+   same lineage envelope `send_batch()` does and goes through the same
+   `_make_envelope` grace-retry — it used to be a separate, older code path
+   that returned a bare string with none of that hardening, leaving the
+   synthesizer exposed to the exact stale-DOM race batch sends were fixed
+   for three commits ago.
 6. `meta.json`'s `round_count` and a `round_id` stamped on every
    `display.jsonl` event are this app's own bookkeeping — separate from, and
    not shared with, the CLI's canonical transcript.

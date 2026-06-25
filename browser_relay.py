@@ -297,13 +297,35 @@ def _force_input_events(page) -> None:
         pass
 
 
+def _insert_text_direct(page, el, message: str) -> bool:
+    """Insert text via Playwright's dedicated Keyboard.insertText.
+
+    Dispatches a real `input` event directly to the focused element -- no
+    OS clipboard write, no clipboard-write permission grant, no async-write-
+    then-paste race, no contention if multiple tabs touch the clipboard in
+    close succession. This is the most direct insertion path Playwright
+    offers for contenteditable/IME-aware editors and is tried FIRST, ahead
+    of clipboard paste, since it sidesteps every clipboard-specific failure
+    mode this codebase has hit outright rather than working around it.
+    """
+    try:
+        el.click()
+        page.keyboard.press("Control+a")  # select existing content so insert replaces it
+        page.keyboard.insert_text(message)
+        return True
+    except Exception:
+        return False
+
+
 def _clipboard_insert(page, message: str) -> bool:
     """Write message to OS clipboard then paste into the focused element.
 
-    execCommand('insertText') is deprecated in recent Chrome and silently fails
-    for ProseMirror editors. Clipboard paste works universally: the whole text
-    lands in one event with no per-character key events and no newline-as-Enter
-    risk.  Returns True on success.
+    Fallback for the rare case _insert_text_direct doesn't register
+    correctly on a given site. execCommand('insertText') is deprecated in
+    recent Chrome and silently fails for ProseMirror editors; clipboard
+    paste works universally as a second-line fallback: the whole text
+    lands in one event with no per-character key events and no newline-as-
+    Enter risk. Returns True on success.
     """
     try:
         # Grant clipboard-write permission for this origin — harmless if already set.
@@ -427,7 +449,18 @@ def _verify_prompt_inserted(el, message: str) -> tuple[bool, str]:
     return False, actual
 
 
-def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
+def _type_and_submit(page, site: dict, message: str, agent: str = "",
+                      fast_mode: bool = False) -> None:
+    """fast_mode tightens the submit-tier verification deadlines below for
+    the batch-send context specifically: _do_send_batch's Step 1 submits to
+    every agent SEQUENTIALLY on this one thread (deliberately -- Playwright's
+    sync API isn't thread-safe across one CDP connection, so this can't be
+    parallelized), which means one agent stuck cycling through all three
+    submit tiers at single-send patience (~20s worst case) fully blocks every
+    later agent in that loop from even starting to type, let alone respond.
+    Single-send (_do_send, health checks) keeps the patient defaults since
+    nothing else is waiting on it there.
+    """
     el = _resolve_selector(page, site["input"])
     if el is None:
         raise RuntimeError(
@@ -449,13 +482,13 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
         el.dispatch_event("input")
         el.dispatch_event("change")
     else:
-        # For all contenteditable (Lexical, ProseMirror, etc.) use clipboard paste.
-        # execCommand('insertText') is deprecated in Chrome 90+ and silently drops
-        # text in ProseMirror on current Chrome. keyboard.type() fires real Enter
-        # events on every \n, submitting Lexical forms mid-message.
-        # Clipboard paste avoids both problems. _clipboard_insert already fires
-        # the input/change nudge internally; the fallback paths below need it too.
-        if not _clipboard_insert(page, message):
+        # For all contenteditable (Lexical, ProseMirror, etc.): try the most
+        # direct path first (Playwright's own insertText), then progressively
+        # less direct fallbacks. keyboard.type() fires real Enter events on
+        # every \n, submitting Lexical forms mid-message -- avoided throughout.
+        if _insert_text_direct(page, el, message):
+            _force_input_events(page)  # cheap defensive nudge even though insertText already fires input
+        elif not _clipboard_insert(page, message):
             if is_lexical:
                 # Lexical fallback: type without newlines to avoid premature submit
                 page.keyboard.press("Control+a")
@@ -496,6 +529,13 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
     pre_url    = page.url  # capture URL for navigation-detection in _verify_sent
     submitted  = False
 
+    # fast_mode (batch context) halves these -- see docstring above.
+    wait_visible_ms = 1500 if fast_mode else 3000
+    enable_poll_s   = 1.5  if fast_mode else 3.0
+    verify1_s       = 2.0  if fast_mode else 4.0
+    verify2_s       = 2.0  if fast_mode else 4.0
+    verify3_s       = 1.0  if fast_mode else 2.0
+
     # Tier 1: configured send button. POLL for it to become enabled (up to
     # ~3s) instead of checking once -- large pastes take the framework a
     # moment to re-render and enable the button, and a single early check
@@ -504,8 +544,8 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
     if send_sel:
         try:
             btn = page.locator(send_sel)
-            btn.first.wait_for(state="visible", timeout=3000)
-            deadline = time.time() + 3.0  # was 2.0 — some frameworks debounce longer
+            btn.first.wait_for(state="visible", timeout=wait_visible_ms)
+            deadline = time.time() + enable_poll_s
             while time.time() < deadline:
                 if btn.count() > 0 and btn.first.is_enabled():
                     btn.first.click()
@@ -516,7 +556,7 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
             pass
         if submitted:
             _save_debug(page, agent, "03_after_send_click")
-            if not _verify_sent(page, site, el, pre_counts, pre_url=pre_url):
+            if not _verify_sent(page, site, el, pre_counts, timeout=verify1_s, pre_url=pre_url):
                 submitted = False  # click was a no-op -- composer never cleared
 
     # Tier 2: JS fallback. Must filter for actual send/submit semantics and
@@ -560,7 +600,7 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
             pass
         if submitted:
             _save_debug(page, agent, "03_after_send_click")
-            if not _verify_sent(page, site, el, pre_counts, pre_url=pre_url):
+            if not _verify_sent(page, site, el, pre_counts, timeout=verify2_s, pre_url=pre_url):
                 submitted = False
 
     # Tier 3: keyboard submit chords, each verified before trying the next --
@@ -577,7 +617,7 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
                 cur_el.press(chord)
             except Exception:
                 continue
-            if _verify_sent(page, site, el, pre_counts, timeout=2.0, pre_url=pre_url):
+            if _verify_sent(page, site, el, pre_counts, timeout=verify3_s, pre_url=pre_url):
                 submitted = True
                 break
 
@@ -652,8 +692,9 @@ def _semantic_counts(page, site: dict) -> dict:
 
 
 def _wait_and_read(page, site: dict, timeout: int, pre_len: int = 0,
-                    pre_counts: dict | None = None, agent: str = "") -> str:
-    """Wait for the AI response then return it.
+                    pre_counts: dict | None = None, agent: str = "",
+                    pre_method: str = "fallback", pre_url: str = "") -> dict:
+    """Wait for the AI response then return it wrapped in a lineage envelope.
 
     Strategy:
     1. Try the site's stop-button selector to detect generation start/end.
@@ -667,22 +708,32 @@ def _wait_and_read(page, site: dict, timeout: int, pre_len: int = 0,
        stability check never even starts until real content exists.
     3. Extract response: try CSS selectors first, then return the page-text
        diff (everything new since before we typed) as a last resort.
+    4. Wrap the captured text through _make_envelope -- the SAME grace-
+       retried, semantic_unconfirmed-aware classification _do_send_batch's
+       path already gets. This used to return a bare string with none of
+       that hardening, leaving the synthesizer (send_message) and
+       full_health_check exposed to the exact stale-DOM race fixed for
+       batch sends. Callers (_do_send, _do_full_health, send_message) were
+       updated for the new dict return type.
     """
-    stop_sel = site.get("stop_btn")
+    stop_sels = site.get("stop_btn") or []
+    if isinstance(stop_sels, str):
+        stop_sels = [stop_sels]
     appeared = False
-    if stop_sel:
+    if stop_sels:
+        # Poll for any stop button to appear (generation started)
         for _ in range(10):
-            try:
-                page.wait_for_selector(stop_sel, timeout=500)
+            if any(page.locator(ss).count() > 0 for ss in stop_sels):
                 appeared = True
                 break
-            except Exception:
-                time.sleep(0.3)
+            time.sleep(0.5)
         if appeared:
-            try:
-                page.wait_for_selector(stop_sel, state="hidden", timeout=timeout * 1000)
-            except Exception:
-                pass
+            # Wait until no stop button is visible (generation done)
+            deadline_stop = time.time() + timeout
+            while time.time() < deadline_stop:
+                if not any(page.locator(ss).count() > 0 for ss in stop_sels):
+                    break
+                time.sleep(0.5)
             # Fast path: if the response selectors still match (the common
             # case), we're done. If they're stale (a UI redesign moved the
             # class names), don't jump straight to the unreliable raw
@@ -690,7 +741,7 @@ def _wait_and_read(page, site: dict, timeout: int, pre_len: int = 0,
             # count/stability logic used when no stop button matched at all.
             resp = _read_last_response(page, site)
             if resp:
-                return resp
+                return _make_envelope(agent, resp, pre_counts or {}, page, site, pre_method, pre_url)
             appeared = False
 
     if not appeared:
@@ -700,7 +751,7 @@ def _wait_and_read(page, site: dict, timeout: int, pre_len: int = 0,
         new_el_seen = False
         if pre_counts:
             while time.time() < deadline:
-                cur_counts = _response_counts(page, site)
+                cur_counts = _semantic_counts(page, site)
                 if any(cur_counts.get(sel, 0) > n for sel, n in pre_counts.items()):
                     new_el_seen = True
                     break
@@ -736,17 +787,17 @@ def _wait_and_read(page, site: dict, timeout: int, pre_len: int = 0,
     # 1. Try specific CSS selectors (fast, precise when selectors are current)
     resp = _read_last_response(page, site)
     if resp:
-        return resp
+        return _make_envelope(agent, resp, pre_counts or {}, page, site, pre_method, pre_url)
 
     # 2. Page-text diff: everything new since before we typed, cleaned of UI chrome.
     if pre_len > 0:
         full = _page_text(page)
         new_text = full[pre_len:].strip()
         if new_text:
-            return _clean_diff(new_text)
+            return _make_envelope(agent, _clean_diff(new_text), pre_counts or {}, page, site, pre_method, pre_url)
 
     _save_debug(page, agent, "04_no_response_captured")
-    return "[No response captured — check the browser window]"
+    return _error_envelope(agent, "[No response captured — check the browser window]")
 
 
 # Long, specific phrases -- safe to substring-match since they're full
@@ -1166,11 +1217,15 @@ class BrowserManager:
 
         try:
             pre_counts = _semantic_counts(page, site)
+            pre_url = page.url
             _type_and_submit(page, site, _PROBE, agent)
-            response = _wait_and_read(page, site, timeout=30,
+            envelope = _wait_and_read(page, site, timeout=30,
                                       pre_len=len(_page_text(page)),
-                                      pre_counts=pre_counts, agent=agent)
+                                      pre_counts=pre_counts, agent=agent,
+                                      pre_method="semantic", pre_url=pre_url)
+            response = envelope.get("payload", "")
             result["response"] = response
+            result["capture_method"] = envelope.get("capture_method")
             # Accept any reply that includes "health" and isn't a failure sentinel
             is_ok = bool(response) and "health" in response.lower()
             is_ok = is_ok and not response.strip().startswith(
@@ -1200,11 +1255,13 @@ class BrowserManager:
             res_q.put(("error", f"[Error: TAB_IDENTITY_MISMATCH — expected '{agent}', got '{marker}']"))
             return
         page.bring_to_front()
-        pre_len = len(_page_text(page))           # snapshot before typing
-        pre_counts = _response_counts(page, site)  # element counts before typing
+        pre_len = len(_page_text(page))            # snapshot before typing
+        pre_counts = _semantic_counts(page, site)  # element counts before typing
+        pre_method = "semantic" if site.get("semantic_sel") else "fallback"
+        pre_url = page.url
         _type_and_submit(page, site, msg, agent)
-        reply = _wait_and_read(page, site, timeout, pre_len, pre_counts, agent)
-        res_q.put(("ok", reply))
+        envelope = _wait_and_read(page, site, timeout, pre_len, pre_counts, agent, pre_method, pre_url)
+        res_q.put(("ok", envelope))
 
     def _do_send_batch(self, payloads: dict, res_q):
         """Submit to all agents sequentially (fast), then poll all round-robin.
@@ -1243,12 +1300,12 @@ class BrowserManager:
                 pre_url    = page.url  # capture BEFORE submit for URL-change detection
                 pre_counts = _semantic_counts(page, site)
                 pre_method = "semantic" if site.get("semantic_sel") else "fallback"
-                _type_and_submit(page, site, msg, ag)
+                _type_and_submit(page, site, msg, ag, fast_mode=True)
                 # For sites that navigate on submit (e.g. Perplexity home → search
                 # result), the pre_len measured on the old page is useless for the
                 # text-diff fallback.  Re-capture from the NEW page if the URL changed.
                 try:
-                    if page.url != site.get("url", page.url).rstrip("/"):
+                    if page.url != pre_url:
                         page.wait_for_load_state("domcontentloaded", timeout=2000)
                         pre_len    = len(_page_text(page))
                         # NOTE: intentionally keep pre_counts from the old page
@@ -1413,7 +1470,10 @@ class BrowserManager:
         """Open a new tab in Chrome and navigate to the agent's site."""
         self._call("open_tab", agent, timeout=35)
 
-    def send_message(self, agent: str, message: str, timeout: int = 120) -> str:
+    def send_message(self, agent: str, message: str, timeout: int = 120) -> dict:
+        """Returns a lineage envelope (dict with a "payload" key), not a bare
+        string -- same shape send_batch's per-agent results already use.
+        """
         return self._call("send", agent, (message, timeout), timeout=timeout + 30)
 
     def send_batch(self, payloads: dict, timeout: int = 120) -> dict:

@@ -667,11 +667,20 @@ def run_synthesis(sid: str, user_msg: str, replies: dict, round_id: int | None =
             st.markdown(f"**SYNTHESIS** (via {browser_synth_agent.upper()})")
             with st.spinner(f"Synthesizing via {browser_synth_agent.upper()}…"):
                 try:
-                    synthesis = mgr.send_message(browser_synth_agent, synth_prompt)
+                    env = mgr.send_message(browser_synth_agent, synth_prompt)
                 except Exception as e:
                     _log.error(f"[sid={sid}, round={round_id}] Synthesis transport error via {browser_synth_agent} — {e}", exc_info=True)
                     st.error(f"Synthesis failed: {e}")
                     return
+            synthesis, validated, raw = _extract_reply(env)
+            # Same stale-DOM quarantine gate run_round applies to every batch
+            # reply — send_message now returns the same lineage envelope, so
+            # synthesis gets the same grace-retry/semantic_unconfirmed
+            # protection instead of trusting whatever text came back.
+            if (not validated and not _is_relay_failure(synthesis)
+                    and raw.get("capture_method") != "semantic_unconfirmed"):
+                pre, nw = raw.get("pre_response_count", "?"), raw.get("new_response_index", "?")
+                synthesis = f"[Error: Stale DOM read — element count {pre}→{nw}, new response not confirmed]"
             if _is_relay_failure(synthesis):
                 _log.warning(f"[sid={sid}, round={round_id}] Synthesis relay failure via {browser_synth_agent} — {synthesis[:120]}")
                 st.error(f"Synthesis failed: {synthesis}")
