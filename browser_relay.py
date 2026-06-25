@@ -1258,10 +1258,18 @@ class BrowserManager:
             except Exception:
                 continue          # page is completely broken — skip it
             try:
-                title = await p.title() # CDP call — can hang on an unresponsive tab
+                # title()/evaluate have no built-in timeout -- an unresponsive
+                # tab can hang the await indefinitely, and since _do_scan is
+                # awaited sequentially by the single dispatch loop, that stalls
+                # every other queued command (scan, assign, send...) behind it.
+                # Bound each per-tab call so one bad tab can't freeze the worker.
+                title = await asyncio.wait_for(p.title(), timeout=2.0)
             except Exception:
                 title = ""        # title is display-only; don't stall the whole scan
-            marker = await _read_page_agent_marker(p)
+            try:
+                marker = await asyncio.wait_for(_read_page_agent_marker(p), timeout=2.0)
+            except Exception:
+                marker = ""
             tabs.append({
                 "url": url, "title": title, "marker": marker,
                 "classification": classify_tab_url(url),

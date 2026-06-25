@@ -70,6 +70,15 @@ API-only CLI with its own canonical-transcript engine — see README.md's
   `_arm_auto_resume`'s CDP `Debugger.paused` auto-resume handler, and
   every selector/timing-sensitive helper need confirming against a real
   tab before trusting this in production.
+- **`_do_scan` bounds every per-tab CDP call with `asyncio.wait_for`.**
+  `page.title()` and the `window.name` marker read (`page.evaluate`) have
+  no built-in Playwright timeout — an unresponsive/stale tab can hang
+  that `await` indefinitely. Because the dispatch loop awaits `_do_scan`
+  to completion before pulling the next queued command, one bad tab used
+  to be able to freeze every later scan/assign/send call too, which
+  surfaced as "switching to Agents and clicking Find Tab hangs." Each
+  call is now capped at 2s (`asyncio.wait_for(..., timeout=2.0)`) so a
+  bad tab costs a few seconds, not an indefinite stall.
 - **`site_key` override beats name inference, always.** `site_for_agent`
   infers a site from an agent's name only when no explicit `site_key` is
   set, and that inference always maps any "claude"-containing name to
