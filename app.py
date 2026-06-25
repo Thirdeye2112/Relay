@@ -6,6 +6,13 @@ from typing import Optional
 import streamlit as st
 from pathlib import Path
 
+try:
+    from relay_log import get_logger as _get_logger
+    _log = _get_logger("relay.app")
+except Exception:
+    import logging
+    _log = logging.getLogger("relay.app")
+
 sys.path.insert(0, str(Path(__file__).parent))
 from relay import (
     load_agents, load_session, load_meta, save_meta,
@@ -26,6 +33,7 @@ try:
 except Exception as _pw_err:
     PLAYWRIGHT_AVAILABLE = False
     PLAYWRIGHT_ERROR = str(_pw_err)
+    _log.error(f"Playwright unavailable: {_pw_err}")
     def site_for_agent(name): return None  # noqa: E704
     SITES = {}
     CDP_URL = "http://localhost:9222"
@@ -90,12 +98,23 @@ def avatar(name: str) -> str:
     names = list(agents_cfg.keys())
     return _EMOJIS[names.index(name) % len(_EMOJIS)] if name in names else "⚪"
 
-def agent_active(cfg) -> bool:
-    if getattr(cfg, "mode", "api") == "browser":
-        m = get_manager()
-        return bool(m and m.has_agent(cfg.name))
+def _api_agent_active(cfg) -> bool:
+    """True when the API key for this agent's provider is set."""
     key = "ANTHROPIC_API_KEY" if cfg.provider == "anthropic" else "OPENAI_API_KEY"
     return bool(os.environ.get(key, ""))
+
+def agent_active(cfg, assigned: "set | None" = None) -> bool:
+    """True when this agent is ready to receive messages.
+
+    For browser agents pass the pre-fetched `assigned` set returned by
+    get_manager().list_agents() to avoid a per-agent queue round-trip.
+    """
+    if getattr(cfg, "mode", "api") == "browser":
+        if assigned is not None:
+            return cfg.name in assigned
+        m = get_manager()
+        return bool(m and m.has_agent(cfg.name))
+    return _api_agent_active(cfg)
 
 def close_worker(name: str) -> None:
     m = get_manager()
@@ -103,7 +122,18 @@ def close_worker(name: str) -> None:
         m.unassign(name)
 
 def active_agents() -> dict:
-    return {n: c for n, c in agents_cfg.items() if agent_active(c)}
+    """Return {name: cfg} for every agent currently ready to receive messages.
+
+    For browser agents this is a single list_agents() call (one queue round-trip)
+    instead of one has_agent() call per agent — critical for tab-switch latency
+    since active_agents() is called unconditionally on every Streamlit rerun.
+    """
+    m        = get_manager()
+    assigned = set(m.list_agents()) if m else set()
+    return {
+        n: c for n, c in agents_cfg.items()
+        if agent_active(c, assigned)
+    }
 
 def save_agents(agents: dict) -> None:
     import yaml
@@ -235,14 +265,17 @@ def auto_assign_tabs(m: "BrowserManager") -> None:
                 break
 
 def find_tab_for_agent(m: "BrowserManager", agent_name: str) -> str | None:
-    """Find an open tab matching this agent and assign it. Returns tab URL or None."""
+    """Find an open tab matching this agent and assign it. Returns tab URL or None.
+
+    No exclusion filter here — when the user explicitly clicks Find Tab they mean
+    the tab they can see; auto_assign_tabs is where we guard against accidental
+    matches (e.g. a claude.ai/code IDE view being grabbed for a chat agent).
+    """
     tabs = m.scan_tabs()
     site = site_for_agent(agent_name)
     if not site:
         return None
     for i, tab in enumerate(tabs):
-        if _is_excluded_tab(tab["url"]):
-            continue
         if site["url_match"] in tab["url"]:
             try:
                 m.assign_tab(agent_name, i)
@@ -280,6 +313,84 @@ def delete_session(sid: str) -> None:
     if p.exists():
         shutil.rmtree(p)
 
+# ── File attachment helpers ───────────────────────────────────────────────────
+
+_UPLOAD_TYPES = [
+    # Text & markdown
+    "txt", "md", "rst", "tex", "log", "diff", "patch",
+    # Code — web
+    "py", "js", "ts", "jsx", "tsx", "vue", "svelte", "html", "css",
+    # Code — systems
+    "go", "rs", "c", "cpp", "h", "cs", "java", "kt", "swift",
+    # Code — scripting
+    "rb", "php", "sh", "bash", "ps1", "bat", "r", "m", "lua", "pl",
+    # Code — functional / other
+    "ex", "exs", "fs", "fsx", "scala", "clj", "dart", "elm", "zig", "nim",
+    # Data & config
+    "json", "jsonl", "ndjson", "yaml", "yml", "toml", "csv", "tsv",
+    "xml", "sql", "ini", "cfg", "conf", "env", "properties",
+    # Documents
+    "pdf", "docx", "doc", "xlsx", "xls", "odt", "rtf",
+    # Notebook
+    "ipynb",
+    # Images (SVG is text; raster images get a helpful decline message)
+    "svg", "png", "jpg", "jpeg", "gif", "webp",
+]
+
+
+def _read_uploaded_file(uploaded) -> str:
+    """Extract text content from an uploaded file, with graceful fallbacks."""
+    import io
+    content = uploaded.read()
+    ext  = (uploaded.name or "").rsplit(".", 1)[-1].lower() if "." in (uploaded.name or "") else ""
+    mime = uploaded.type or ""
+
+    if ext == "pdf" or "pdf" in mime:
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(io.BytesIO(content))
+            return "\n".join(p.extract_text() or "" for p in reader.pages)
+        except ImportError:
+            return "[PDF attached — run: pip install pypdf]"
+
+    if ext in ("docx", "doc"):
+        try:
+            import docx as _docx
+            doc = _docx.Document(io.BytesIO(content))
+            return "\n".join(p.text for p in doc.paragraphs if p.text)
+        except ImportError:
+            return "[DOCX attached — run: pip install python-docx]"
+        except Exception as e:
+            return f"[Could not read DOCX: {e}]"
+
+    if ext in ("xlsx", "xls"):
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+            lines = []
+            for sheet in wb.worksheets:
+                lines.append(f"--- Sheet: {sheet.title} ---")
+                for row in sheet.iter_rows(values_only=True):
+                    lines.append("\t".join("" if v is None else str(v) for v in row))
+            return "\n".join(lines)
+        except ImportError:
+            return "[XLSX attached — run: pip install openpyxl]"
+        except Exception as e:
+            return f"[Could not read XLSX: {e}]"
+
+    if ext in ("png", "jpg", "jpeg", "gif", "webp", "bmp", "ico"):
+        return f"[Image: {uploaded.name} — image data cannot be sent as text to browser agents]"
+
+    # All other types: decode as text
+    try:
+        return content.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            return content.decode("latin-1")
+        except Exception:
+            return f"[Binary file: {uploaded.name} — could not extract text content]"
+
+
 # ── Display log ───────────────────────────────────────────────────────────────
 
 def display_path(sid: str) -> Path:
@@ -311,25 +422,182 @@ def render_display(sid: str) -> None:
     p = display_path(sid)
     if not p.exists():
         return
-    for line in p.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        ev = json.loads(line)
-        if ev["type"] == "user":
-            with st.chat_message("user", avatar="🧑"):
-                st.markdown(ev["content"])
-        elif ev["type"] == "reply":
-            _render_agent_reply(ev["agent"], ev["content"])
-        elif ev["type"] == "synthesis":
-            with st.chat_message("synthesis", avatar="🔮"):
-                st.markdown(f"**SYNTHESIS**\n\n{ev['content']}")
-        elif ev["type"] == "auto_round_marker":
-            st.caption(ev["content"])
-        elif ev["type"] == "payload_dump":
-            with st.expander("🔍 Payloads sent this round"):
-                for name, payload in ev["payloads"].items():
-                    st.caption(name.upper())
-                    st.code(payload, language=None)
+
+    events = [json.loads(ln) for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+
+    # Group events by round_id (0 = pre-session / legacy events)
+    from collections import defaultdict
+    by_round: dict[int, list] = defaultdict(list)
+    for ev in events:
+        by_round[ev.get("round_id") or 0].append(ev)
+
+    for rid in sorted(by_round.keys()):
+        revents = by_round[rid]
+
+        # Round header
+        marker = next((e["content"] for e in revents if e["type"] == "auto_round_marker"), None)
+        if rid == 0:
+            pass  # pre-session events — no header
+        elif marker:
+            st.markdown(f"---\n#### {marker}")
+        else:
+            st.markdown(f"---\n#### Round {rid}")
+
+        # Collect debug items: payloads + failure notices + lineage warnings
+        debug_items       = []
+        failures          = []
+        envelope_warnings = []  # [(agent, warning_str), ...]
+
+        for ev in revents:
+            etype = ev["type"]
+            if etype == "user":
+                with st.chat_message("user", avatar="🧑"):
+                    st.markdown(ev["content"])
+            elif etype == "reply":
+                content = ev["content"]
+                env_e   = ev.get("envelope", {})
+                if _is_relay_failure(content):
+                    # Pass full envelope so debug expander can show quarantine detail
+                    failures.append((ev["agent"], content, env_e))
+                    # Failures rendered below in debug expander — not in chat stream
+                else:
+                    retry_tag = " *(retry)*" if ev.get("retry") else ""
+                    with st.chat_message(ev["agent"], avatar=avatar(ev["agent"])):
+                        st.markdown(f"**{ev['agent'].upper()}**{retry_tag}\n\n{content}")
+                # Collect any lineage warnings from the envelope
+                for w in env_e.get("warnings", []):
+                    envelope_warnings.append((ev["agent"], w))
+            elif etype == "synthesis":
+                with st.chat_message("synthesis", avatar="🔮"):
+                    st.markdown(f"**SYNTHESIS**\n\n{ev['content']}")
+            elif etype == "auto_round_marker":
+                pass  # already shown in header
+            elif etype == "payload_dump":
+                debug_items.append(ev)
+
+        # Debug / Recovery panel — shown only when there is something to show
+        if failures or debug_items or envelope_warnings:
+            label = f"🔍 Debug / Recovery — {len(failures)} failure(s)" if failures else "🔍 Debug"
+            with st.expander(label, expanded=bool(failures)):
+                for ag, content, env_f in failures:
+                    st.error(f"⚠️ System Failure Notice — **{ag.upper()}**: {content}")
+                    # Quarantine detail: structured reason + raw captured text
+                    if env_f.get("quarantined"):
+                        reason = env_f.get("discard_reason") or "unknown"
+                        st.caption(f"Quarantine reason: {reason}")
+                        raw_cap = env_f.get("raw_payload") or ""
+                        if raw_cap and raw_cap != content:
+                            with st.expander(f"Raw capture — {ag.upper()}", expanded=False):
+                                st.code(raw_cap[:1000], language=None)
+                    # Capture method if degraded
+                    cm = env_f.get("capture_method")
+                    if cm and cm != "semantic":
+                        st.caption(f"Capture method: {cm}")
+                if envelope_warnings:
+                    for ag, w in envelope_warnings:
+                        st.caption(f"⚡ Lineage — **{ag.upper()}**: {w}")
+                for ev in debug_items:
+                    st.caption("Payloads transmitted this round:")
+                    for name, payload in ev.get("payloads", {}).items():
+                        st.caption(name.upper())
+                        st.code(payload, language=None)
+
+# ── Transcript export ─────────────────────────────────────────────────────────
+
+def _generate_clean_transcript(sid: str) -> str:
+    """Markdown export: round labels, user prompts, valid agent replies only."""
+    meta   = load_meta(sid)
+    p      = display_path(sid)
+    agents = meta.get("agents", [])
+    lines  = [
+        f"# {meta.get('topic', 'Relay Conversation')}",
+        f"Agents: {', '.join(a.upper() for a in agents)}",
+        f"Created: {meta.get('created', '')}",
+        "",
+        "---",
+    ]
+    if not p.exists():
+        return "\n".join(lines + ["", "No transcript yet."])
+
+    from collections import defaultdict
+    events   = [json.loads(ln) for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    by_round: dict = defaultdict(list)
+    for ev in events:
+        by_round[ev.get("round_id") or 0].append(ev)
+
+    for rid in sorted(by_round.keys()):
+        revents = by_round[rid]
+        marker  = next((e["content"] for e in revents if e["type"] == "auto_round_marker"), None)
+        if rid == 0 and not marker:
+            pass
+        elif marker:
+            lines += ["", f"## {marker}", ""]
+        else:
+            lines += ["", f"## Round {rid}", ""]
+
+        for ev in revents:
+            etype   = ev["type"]
+            content = ev.get("content", "")
+            if etype == "user":
+                lines += [f"**You:** {content}", ""]
+            elif etype == "reply" and not _is_relay_failure(content) and not _is_bad_capture(content):
+                retry_tag = " *(retry)*" if ev.get("retry") else ""
+                lines += [f"**{ev['agent'].upper()}**{retry_tag}:", content, ""]
+            elif etype == "synthesis":
+                lines += ["**SYNTHESIS:**", content, ""]
+
+    return "\n".join(lines)
+
+
+def _generate_debug_transcript(sid: str) -> str:
+    """Markdown export including full lineage envelope metadata."""
+    meta  = load_meta(sid)
+    p     = display_path(sid)
+    lines = [
+        f"# Debug Transcript — {sid}",
+        f"Topic: {meta.get('topic', '')}",
+        f"Created: {meta.get('created', '')}",
+        "",
+    ]
+    if not p.exists():
+        return "\n".join(lines + ["No events yet."])
+
+    events = [json.loads(ln) for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    for ev in events:
+        etype   = ev.get("type", "?")
+        rid     = ev.get("round_id", "—")
+        content = ev.get("content", "")
+        if etype == "reply":
+            env   = ev.get("envelope", {})
+            retry = " [RETRY]" if ev.get("retry") else ""
+            lines += [
+                f"### [{etype.upper()}] {ev.get('agent','?').upper()} — Round {rid}{retry}",
+                f"- validated: {env.get('validated', '?')}",
+                f"- capture_method: {env.get('capture_method', '?')}",
+                f"- pre_count: {env.get('pre_response_count', '?')}",
+                f"- new_index: {env.get('new_response_index', '?')}",
+                f"- warnings: {env.get('warnings', [])}",
+                f"- event_id: {env.get('event_id', '?')}",
+                f"- failure: {_is_relay_failure(content)}",
+                "",
+                "```",
+                content[:600] + ("…" if len(content) > 600 else ""),
+                "```",
+                "",
+            ]
+        elif etype == "payload_dump":
+            lines.append(f"### [PAYLOAD_DUMP] Round {rid}")
+            for name, pl in ev.get("payloads", {}).items():
+                lines += [f"**{name.upper()}** ({len(pl):,} chars)", "```", pl[:400] + "…", "```", ""]
+        elif etype == "auto_round_marker":
+            lines += [f"### [ROUND MARKER] {content}", ""]
+        elif etype == "user":
+            lines += [f"### [USER] Round {rid}", content[:400], ""]
+        elif etype == "synthesis":
+            lines += [f"### [SYNTHESIS] Round {rid}", content[:400], ""]
+
+    return "\n".join(lines)
+
 
 # ── Synthesizer ───────────────────────────────────────────────────────────────
 
@@ -379,9 +647,11 @@ def run_synthesis(sid: str, user_msg: str, replies: dict, round_id: int | None =
                 try:
                     synthesis = mgr.send_message(browser_synth_agent, synth_prompt)
                 except Exception as e:
+                    _log.error(f"[sid={sid}, round={round_id}] Synthesis transport error via {browser_synth_agent} — {e}", exc_info=True)
                     st.error(f"Synthesis failed: {e}")
                     return
             if _is_relay_failure(synthesis):
+                _log.warning(f"[sid={sid}, round={round_id}] Synthesis relay failure via {browser_synth_agent} — {synthesis[:120]}")
                 st.error(f"Synthesis failed: {synthesis}")
                 return
             st.markdown(synthesis)
@@ -405,6 +675,7 @@ def run_synthesis(sid: str, user_msg: str, replies: dict, round_id: int | None =
                 _stream_anthropic("claude-haiku-4-5-20251001", synth_msgs)
             )
         except Exception as e:
+            _log.error(f"[sid={sid}, round={round_id}] Synthesis API error — {e}", exc_info=True)
             st.error(_api_error(e))
             return
 
@@ -412,7 +683,9 @@ def run_synthesis(sid: str, user_msg: str, replies: dict, round_id: int | None =
 
 # ── Group round ───────────────────────────────────────────────────────────────
 
-_MAX_CROSS_CHARS = 1500  # cap each agent's reply before cross-injecting
+_MAX_CROSS_CHARS        = 1500   # per-agent cap (normal sessions)
+_CROSS_CONTEXT_THRESHOLD = 16_000  # total chars across all agents before tightening
+_CROSS_CONTEXT_TIGHT_CAP = 600    # per-agent cap when over threshold
 
 # Sentinels Relay itself produces when a browser agent's round failed --
 # a typed-but-never-sent message, a timeout, a missing tab, etc. These must
@@ -426,6 +699,43 @@ _FAILURE_PREFIXES = ("[Error:", "[Timed out]", "[No response captured", "[Not se
 def _is_relay_failure(text: str) -> bool:
     t = (text or "").strip()
     return t.startswith(_FAILURE_PREFIXES)
+
+
+# Payload quality guard — catches bad captures that don't start with a known
+# sentinel but are still clearly not real agent speech.
+_PAYLOAD_ECHO_PHRASES = [
+    "HOW THE RELAY WORKS",
+    "=== New relay session starting ===",
+    "The other panelists said:",
+    "=== INSTRUCTIONS ===",
+]
+
+def _is_bad_capture(payload: str) -> bool:
+    """True for empty, known-failure, or prompt-echo payloads."""
+    t = (payload or "").strip()
+    if not t:
+        return True
+    if t.startswith(_FAILURE_PREFIXES):
+        return True
+    return any(phrase in payload for phrase in _PAYLOAD_ECHO_PHRASES)
+
+def _validate_payload_quality(payload: str) -> "tuple[bool, str | None]":
+    """Returns (is_valid, failure_reason).  Conservative — only rejects obvious bad captures."""
+    if _is_bad_capture(payload):
+        snippet = (payload or "").strip()[:100]
+        return False, f"Bad capture marker or prompt echo: {snippet!r}"
+    return True, None
+
+
+def _extract_reply(env) -> tuple[str, bool, dict]:
+    """Unpack a browser_relay lineage envelope.
+
+    Returns (payload_str, validated_bool, raw_envelope_dict).
+    Accepts a plain string too (legacy / API-agent path) — treated as valid.
+    """
+    if isinstance(env, dict):
+        return env.get("payload", ""), env.get("validated", True), env
+    return str(env), True, {}
 
 
 def _render_agent_reply(name: str, content: str) -> None:
@@ -442,25 +752,46 @@ def _render_agent_reply(name: str, content: str) -> None:
 
 
 def _build_cross_context(sid: str, my_name: str, participants: dict) -> str:
-    """Return the last SUCCESSFUL reply from every other participant."""
-    parts = []
+    """Return the last SUCCESSFUL reply from every other participant.
+
+    Applies a tighter per-agent cap when total cross-context exceeds
+    _CROSS_CONTEXT_THRESHOLD to prevent runaway prompt growth in long sessions.
+    Bad captures (echoes, empty strings) are excluded regardless of cap.
+    """
+    # First pass: collect latest valid replies and measure total size
+    raw: dict[str, str] = {}
     for name in participants:
         if name == my_name:
             continue
         history = load_session(sid, name)
         last = next(
             (m.content for m in reversed(history)
-             if m.role == "assistant" and not _is_relay_failure(m.content)),
+             if m.role == "assistant"
+             and not _is_relay_failure(m.content)
+             and not _is_bad_capture(m.content)),
             None,
         )
         if last:
-            snippet = last[:_MAX_CROSS_CHARS]
-            if len(last) > _MAX_CROSS_CHARS:
-                snippet += "\n[…truncated — see full reply in browser]"
-            parts.append(f"[{name.upper()}]: {snippet}")
-    if not parts:
+            raw[name] = last
+
+    if not raw:
         return ""
-    return "The other panelists said:\n\n" + "\n\n".join(parts)
+
+    total = sum(len(v) for v in raw.values())
+    tight = total > _CROSS_CONTEXT_THRESHOLD
+    cap   = _CROSS_CONTEXT_TIGHT_CAP if tight else _MAX_CROSS_CHARS
+
+    parts = []
+    for name, last in raw.items():
+        snippet = last[:cap]
+        if len(last) > cap:
+            suffix = ("\n[…condensed — context condensed to stay within size limits]"
+                      if tight else "\n[…truncated — see full reply in browser]")
+            snippet += suffix
+        parts.append(f"[{name.upper()}]: {snippet}")
+
+    header = "[Context condensed — long session. Focus on the most recent points.]\n\n" if tight else ""
+    return header + "The other panelists said:\n\n" + "\n\n".join(parts)
 
 
 def _build_browser_msg(sid: str, name: str, cfg, active: dict, user_msg: str) -> str:
@@ -561,17 +892,68 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
     for name in active:
         append_message(sid, name, Message("user", user_msg))
 
-    replies: dict = {}
+    replies:  dict = {}
+    raw_envs: dict = {}  # {agent: raw envelope dict} — for display lineage metadata
+
+    # Track last round prompt so Retry Failed Agents can re-use it
+    st.session_state[f"last_round_prompt_{sid}"] = user_msg
 
     # ── Browser agents — submit all at once, wait in parallel ─────────────────
     if browser_agents and payloads and mgr:
+        _set_agent_statuses({n: "Sending" for n in browser_agents})
         agent_list = ", ".join(payloads.keys())
         with st.spinner(f"Waiting for {agent_list}…"):
             try:
                 batch = mgr.send_batch(payloads)
-                replies.update(batch)
             except Exception as e:
-                st.error(f"Batch send failed: {e}")
+                _log.error(f"[sid={sid}, round={round_id}] Batch transport error — {e}", exc_info=True)
+                st.error(f"⚠️ System Failure Notice: Batch transport error — {e}")
+                batch = {}
+
+        for name, env in batch.items():
+            payload, validated, raw = _extract_reply(env)
+            # Stamp round_id into the envelope before any other mutation (fix 2:
+            # was patched after-the-fact; now complete at write time)
+            if isinstance(env, dict):
+                env["round_id"] = round_id
+
+            raw_payload    = payload  # preserve original captured text for quarantine record
+            discard_reason: "str | None" = None
+            quarantined    = False
+
+            # Reject stale DOM reads before they enter the relay as real content
+            if not validated and not _is_relay_failure(payload):
+                pre = raw.get("pre_response_count", "?")
+                nw  = raw.get("new_response_index", "?")
+                discard_reason = (f"Stale DOM read — element count {pre}→{nw}, "
+                                  f"new response not confirmed")
+                payload     = f"[Error: {discard_reason}]"
+                quarantined = True
+
+            # Quality validation — second line of defense (e.g. prompt echo)
+            if not _is_relay_failure(payload):
+                quality_ok, quality_reason = _validate_payload_quality(payload)
+                if not quality_ok:
+                    discard_reason = f"Payload quality — {quality_reason}"
+                    raw_payload    = payload  # capture the text that failed quality
+                    payload        = f"[Error: {discard_reason}]"
+                    quarantined    = True
+
+            # Stamp quarantine fields into the envelope so they land in display.jsonl
+            if isinstance(raw, dict):
+                raw["quarantined"]    = quarantined
+                raw["discard_reason"] = discard_reason
+                raw["raw_payload"]    = raw_payload if quarantined else None
+
+            if quarantined:
+                _log.warning(f"[sid={sid}, round={round_id}, agent={name}] Quarantined — {discard_reason}")
+            elif _is_relay_failure(payload):
+                _log.warning(f"[sid={sid}, round={round_id}, agent={name}] Relay failure — {payload[:120]}")
+
+            raw_envs[name] = raw
+            replies[name]  = payload
+            status = "Failed" if _is_relay_failure(payload) else "Done"
+            _set_agent_statuses({name: status})
 
         for name in browser_agents:
             if name not in replies:
@@ -586,11 +968,15 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
                 reply = st.write_stream(stream_agent(cfg, load_session(sid, name)))
                 replies[name] = reply
             except Exception as e:
+                _log.error(f"[sid={sid}, round={round_id}, agent={name}] API agent failed — {e}", exc_info=True)
                 st.error(f"**{name.upper()} failed:** {e}")
 
     # ── Persist replies ────────────────────────────────────────────────────────
     for name, reply in replies.items():
-        append_display(sid, {"type": "reply", "agent": name, "content": reply, "round_id": round_id})
+        # Store lineage envelope metadata (without the payload itself to avoid duplication)
+        env_meta = {k: v for k, v in raw_envs.get(name, {}).items() if k != "payload"}
+        append_display(sid, {"type": "reply", "agent": name, "content": reply,
+                             "round_id": round_id, "envelope": env_meta})
         append_message(sid, name, Message("assistant", reply))
 
     # Cross-inject all other agents' replies as ONE bundled user message.
@@ -634,34 +1020,149 @@ _AUTO_CONTINUE_MSG = (
     "above and respond directly. Do not restart the topic."
 )
 
+_FINAL_SYNTHESIS_PROMPT = (
+    "This is the final synthesis round. Based on everything discussed so far:\n\n"
+    "1. State your single strongest conclusion — what you are most confident about.\n"
+    "2. Flag the most critical remaining risk or open question.\n"
+    "3. Based on your role in this panel, name one concrete next action "
+    "you are taking ownership of.\n\n"
+    "Be direct and specific. This round produces the handoff brief."
+)
+
+
+def _set_agent_statuses(updates: dict) -> None:
+    """Write agent status tiles to session state. Called synchronously in run_round."""
+    if "agent_statuses" not in st.session_state:
+        st.session_state.agent_statuses = {}
+    st.session_state.agent_statuses.update(updates)
+
 def run_auto_rounds(sid: str, participants: dict, user_msg: str,
-                     n_rounds: int, synthesize: bool = True) -> None:
-    """Run the human's message, then N-1 further rounds automatically with
-    no further human input -- each round uses the existing cross-injection
-    mechanism (every agent sees every other agent's latest reply) the same
-    way a manually-typed round does. This is the actual point of Relay:
-    push once, let the panel go back and forth on its own.
+                     n_rounds: int | None, synthesize: bool = True) -> None:
+    """Run the human's message, then further rounds automatically.
 
-    Matches the flow the (unbuilt) Genius repo's API spec describes --
-    prompt -> simultaneous responses -> critique round(s) -> synthesis --
-    just running it over browser tabs instead of direct API calls.
+    n_rounds=None means unlimited -- keeps going until Stop is clicked.
 
-    Known limitation: Streamlit can't process a "stop" click while this
-    function is running (the script thread is busy until it returns), so
-    rounds are capped up front rather than offering live mid-run cancel.
-    Each round still renders its replies as they complete, same as a single
-    manual round always has -- you see progress, you just can't interrupt it.
+    Caveat, stated honestly rather than assumed: this checks
+    st.session_state.relay_stop BETWEEN loop iterations within one
+    continuous Python call. On Streamlit 1.58 (installed version, no
+    @st.fragment / exception handling wrapping this loop), a NEW widget
+    interaction during a running script triggers Streamlit's own
+    interruption of that script wherever it currently is -- this is not
+    guaranteed to land cleanly between rounds; it can land mid-round (e.g.
+    mid mgr.send_batch()). In practice the blocking native calls inside
+    run_round have no Streamlit checkpoints for Streamlit to interrupt at
+    until they return, so interruption likely does land between rounds
+    most of the time -- but that's an observation, not a guarantee. If
+    testing shows Stop actually tears state, the real fix is restructuring
+    this into a session_state-driven, one-round-per-script-rerun state
+    machine (each round its own st.rerun(), Stop becomes a normal widget
+    check before the next round starts) rather than patching this loop further.
     """
+    st.session_state.relay_stop = False
+    _set_agent_statuses({n: "Sending" for n in participants})
     run_round(sid, participants, user_msg, synthesize=synthesize)
-    for i in range(2, n_rounds + 1):
-        marker = f"🔁 Round {i}/{n_rounds} — auto-continuing"
+    i = 2
+    while n_rounds is None or i <= n_rounds:
+        if st.session_state.get("relay_stop"):
+            st.info("⏹ Auto-loop stopped after round completion.")
+            break
+        _set_agent_statuses({n: "Sending" for n in participants})
+        label = f"Round {i}" if n_rounds is None else f"Round {i}/{n_rounds}"
+        marker = f"🔁 {label} — auto-continuing"
         run_round(sid, participants, _AUTO_CONTINUE_MSG, synthesize=synthesize, round_label=marker)
+        i += 1
+
+
+def retry_failed_agents(sid: str, participants: dict) -> int:
+    """Re-send last round's prompt only to agents that failed. Returns count of retried agents.
+
+    Retry results attach to the same round_id so they appear in the same
+    round group in render_display. Successful retries are cross-injected;
+    continued failures stay as system notices. Does not advance round_count.
+    """
+    meta     = load_meta(sid)
+    round_id = meta.get("round_count", 0)
+    if round_id == 0:
+        return 0
+
+    p = display_path(sid)
+    if not p.exists():
+        return 0
+
+    events = [json.loads(ln) for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    last_replies = {
+        e["agent"]: e["content"]
+        for e in events
+        if e.get("type") == "reply" and e.get("round_id") == round_id
+    }
+    failed_names = {n for n, c in last_replies.items() if _is_relay_failure(c)}
+    if not failed_names:
+        return 0
+
+    failed_participants = {n: c for n, c in participants.items() if n in failed_names}
+    last_prompt = st.session_state.get(f"last_round_prompt_{sid}", _AUTO_CONTINUE_MSG)
+    mgr = get_manager()
+    if not mgr:
+        return 0
+
+    browser_failed = {n: c for n, c in failed_participants.items()
+                      if getattr(c, "mode", "api") == "browser" and mgr.has_agent(n)}
+    if not browser_failed:
+        return 0
+
+    payloads = {n: _build_browser_msg(sid, n, c, participants, last_prompt)
+                for n, c in browser_failed.items()}
+
+    _set_agent_statuses({n: "Sending" for n in browser_failed})
+    with st.spinner(f"Retrying {', '.join(browser_failed)} …"):
+        try:
+            batch = mgr.send_batch(payloads)
+        except Exception as e:
+            _log.error(f"[sid={sid}, round={round_id}] Retry transport error — {e}", exc_info=True)
+            st.error(f"⚠️ Retry transport error: {e}")
+            return 0
+
+    new_replies: dict = {}
+    for name, env in batch.items():
+        payload, validated, raw = _extract_reply(env)
+        if isinstance(env, dict):
+            env["round_id"] = round_id
+        if not validated and not _is_relay_failure(payload):
+            pre = raw.get("pre_response_count", "?")
+            nw  = raw.get("new_response_index", "?")
+            payload = f"[Error: Retry stale DOM read — element count {pre}→{nw}]"
+        if not _is_relay_failure(payload):
+            quality_ok, quality_reason = _validate_payload_quality(payload)
+            if not quality_ok:
+                payload = f"[Error: Retry quality — {quality_reason}]"
+
+        env_meta = {k: v for k, v in raw.items() if k != "payload"} if isinstance(raw, dict) else {}
+        append_display(sid, {"type": "reply", "agent": name, "content": payload,
+                             "round_id": round_id, "envelope": env_meta, "retry": True})
+        _render_agent_reply(name, payload)
+
+        if not _is_relay_failure(payload):
+            append_message(sid, name, Message("assistant", payload))
+            new_replies[name] = payload
+            _set_agent_statuses({name: "Done"})
+        else:
+            _set_agent_statuses({name: "Failed"})
+
+    # Cross-inject only the new successful replies into the other agents' contexts
+    for name, reply in new_replies.items():
+        for other in participants:
+            if other != name:
+                append_message(sid, other, Message("user", f"[{name.upper()}]: {reply}"))
+
+    return len(browser_failed)
 
 
 # ── Session state ─────────────────────────────────────────────────────────────
 
-if "active_session" not in st.session_state: st.session_state.active_session = None
-if "edit_agent"     not in st.session_state: st.session_state.edit_agent     = None
+if "active_session"  not in st.session_state: st.session_state.active_session  = None
+if "edit_agent"      not in st.session_state: st.session_state.edit_agent      = None
+if "relay_stop"      not in st.session_state: st.session_state.relay_stop      = False
+if "agent_statuses"  not in st.session_state: st.session_state.agent_statuses  = {}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Sidebar
@@ -792,72 +1293,211 @@ if mode == "Conversations":
         if not participants:
             st.info("No browsers open yet — launch agents in the **Agents** tab, then come back and send a message.")
         else:
-            sc1, sc2 = st.columns([3, 2])
-            with sc1:
-                synthesize = st.toggle("🔮 Synthesizer", value=True,
-                                       help="After each round, a neutral pass summarizes agreements, tensions, and missed angles.")
-            with sc2:
-                auto_rounds = st.number_input(
-                    "🔁 Max rounds", min_value=1, max_value=10, value=3,
-                    help="Push your message once, then let the panel go back and "
-                         "forth this many rounds with no further input from you. "
-                         "Each round costs real model usage across every tab, and "
-                         "once started this can't be cancelled mid-run -- it has to "
-                         "finish the rounds it was given.",
-                )
+            # ── Compact Operator Control Panel ────────────────────────────────
+            # Initialize session-backed control state so values survive reruns.
+            _k_agents  = f"ctrl_agents_{sid}"
+            _k_rounds  = f"ctrl_rounds_{sid}"
+            _k_synth   = f"ctrl_synth_{sid}"
+            # Seed defaults only on first render for this session
+            if _k_agents not in st.session_state:
+                st.session_state[_k_agents] = list(participants.keys())
+            else:
+                # Drop any stored names that are no longer active participants
+                valid = [n for n in st.session_state[_k_agents] if n in participants]
+                st.session_state[_k_agents] = valid if valid else list(participants.keys())
+
+            with st.container(border=True):
+                cp1, cp2, cp3 = st.columns([4, 2, 1])
+                with cp1:
+                    selected_names = st.multiselect(
+                        "Agents this round",
+                        options=list(participants.keys()),
+                        default=st.session_state[_k_agents],
+                        format_func=lambda n: f"{avatar(n)} {n.upper()}",
+                        label_visibility="collapsed",
+                        key=_k_agents,
+                    )
+                    round_participants = {n: participants[n] for n in selected_names}
+                with cp2:
+                    unlimited = st.checkbox("♾️ Unlimited rounds", key=f"ctrl_unlimited_{sid}")
+                    auto_rounds = st.number_input(
+                        "Max rounds", min_value=1, max_value=10, value=3,
+                        label_visibility="collapsed",
+                        key=_k_rounds,
+                        disabled=unlimited,
+                        help="Ignored while Unlimited is checked — use ⏹ Stop After Round to end an unlimited run.",
+                    )
+                with cp3:
+                    st.metric("Round", meta.get("round_count", 0))
+
+                ctrl1, ctrl2, ctrl3, ctrl4, ctrl5 = st.columns(5)
+                with ctrl1:
+                    synthesize = st.toggle("🔮 Synthesize", value=True, key=_k_synth)
+                with ctrl2:
+                    stop_btn = st.button("⏹ Stop After Round", use_container_width=True)
+                    if stop_btn:
+                        st.session_state.relay_stop = True
+                        st.rerun()
+                with ctrl3:
+                    final_synth_btn = st.button("🎯 Final Synthesis", use_container_width=True,
+                                                help="Run one final round prompting each agent to state their "
+                                                     "strongest conclusion, flag remaining risks, and delegate tasks.")
+                with ctrl4:
+                    retry_btn = st.button("🔄 Retry Failed", use_container_width=True,
+                                          help="Re-send last round's prompt to failed agents only.")
+                with ctrl5:
+                    stop_status = "🔴 Stop queued" if st.session_state.get("relay_stop") else "🟢 Running"
+                    st.caption(stop_status)
+
+            # ── Agent Status Grid ─────────────────────────────────────────────
+            statuses = st.session_state.get("agent_statuses", {})
+            if statuses:
+                status_cols = st.columns(len(statuses))
+                _STATUS_ICONS = {
+                    "Ready": "⬜", "Checking": "🟠", "Healthy": "🟢",
+                    "Sending": "🟡", "Waiting": "🔵", "Failed": "🔴", "Done": "🟢",
+                }
+                for col, (ag, st_val) in zip(status_cols, statuses.items()):
+                    icon = _STATUS_ICONS.get(st_val, "⬜")
+                    col.caption(f"{icon} {ag.upper()}\n{st_val}")
+
+            # ── Duplicate tab warning ─────────────────────────────────────────
+            # If two agents share the same Chrome tab, each prompt intended for
+            # one agent is also pasted into the other's composer — causing the
+            # "architect prompt appeared in optimist's tab" symptom.
+            _mgr_dup = get_manager()
+            if _mgr_dup:
+                try:
+                    _dup_groups = _mgr_dup.find_duplicate_tabs()
+                    for _grp in _dup_groups:
+                        st.warning(
+                            f"⚠️ **Duplicate tab assignment**: {' and '.join(a.upper() for a in _grp)} "
+                            f"are assigned to the **same** Chrome tab. "
+                            "Prompts for one agent will land in the other's input. "
+                            "Go to **Agents** → unassign one, then assign it to a different tab.",
+                            icon="⚠️",
+                        )
+                except Exception:
+                    pass
+
+            # ── Export ────────────────────────────────────────────────────────
+            if display_path(sid).exists():
+                ex1, ex2 = st.columns(2)
+                with ex1:
+                    st.download_button(
+                        "📄 Export Clean Transcript",
+                        data=_generate_clean_transcript(sid),
+                        file_name=f"relay-{sid}-clean.md",
+                        mime="text/markdown",
+                        use_container_width=True,
+                    )
+                with ex2:
+                    st.download_button(
+                        "📋 Export Debug Transcript",
+                        data=_generate_debug_transcript(sid),
+                        file_name=f"relay-{sid}-debug.md",
+                        mime="text/markdown",
+                        use_container_width=True,
+                    )
 
             # ── File attachment ───────────────────────────────────────────────
-            uploaded = st.file_uploader(
-                "Attach a file (content included in next message)",
-                type=["txt","md","py","js","ts","jsx","tsx","html","css","json",
-                      "yaml","yml","toml","csv","xml","sh","sql","go","rs","java",
-                      "c","cpp","h","rb","php","swift","kt","r","tex","pdf"],
-                label_visibility="collapsed",
+            uploaded_files = st.file_uploader(
+                "📂 Drag & drop or click to attach — text, code, PDF, DOCX, XLSX, images and more",
+                type=_UPLOAD_TYPES,
+                accept_multiple_files=True,
                 key=f"upload_{sid}",
             )
-            if uploaded:
-                try:
-                    if uploaded.type == "application/pdf":
-                        import io
-                        try:
-                            import pypdf
-                            reader = pypdf.PdfReader(io.BytesIO(uploaded.read()))
-                            file_text = "\n".join(p.extract_text() or "" for p in reader.pages)
-                        except ImportError:
-                            file_text = "[PDF attached — install pypdf to extract text: pip install pypdf]"
-                    else:
-                        file_text = uploaded.read().decode("utf-8", errors="replace")
-                    st.session_state[f"file_content_{sid}"] = (uploaded.name, file_text)
-                    st.caption(f"📎 **{uploaded.name}** ({len(file_text):,} chars) — will be included in next message")
-                except Exception as e:
-                    st.warning(f"Could not read file: {e}")
-            elif f"file_content_{sid}" in st.session_state:
-                name, _ = st.session_state[f"file_content_{sid}"]
+            upload_errors = []
+            if uploaded_files:
+                combined_parts = []
+                for uf in uploaded_files:
+                    try:
+                        text = _read_uploaded_file(uf)
+                        combined_parts.append((uf.name, text))
+                    except Exception as e:
+                        _log.error(f"[sid={sid}] File upload failed — {uf.name}: {e}", exc_info=True)
+                        upload_errors.append(f"{uf.name}: {e}")
+                if combined_parts:
+                    # Merge all files into one staged attachment
+                    merged_name  = ", ".join(n for n, _ in combined_parts)
+                    merged_text  = "\n\n".join(
+                        f"[File: {n}]\n```\n{t}\n```" for n, t in combined_parts
+                    )
+                    st.session_state[f"file_content_{sid}"] = (merged_name, merged_text)
+
+            # Staged-file confirmation + X button — always rendered BEFORE
+            # any error message so the button is never blocked by an error banner
+            if f"file_content_{sid}" in st.session_state:
+                fc_name, fc_text = st.session_state[f"file_content_{sid}"]
                 col1, col2 = st.columns([6, 1])
                 with col1:
-                    st.caption(f"📎 **{name}** attached")
+                    st.caption(f"📎 **{fc_name}** ({len(fc_text):,} chars) — will be included in next message")
                 with col2:
                     if st.button("✕", key="clear_file"):
                         del st.session_state[f"file_content_{sid}"]
                         st.rerun()
+
+            for upload_error in upload_errors:
+                st.warning(f"Could not read file: {upload_error}")
+
+            # ── Retry Failed Agents ───────────────────────────────────────────
+            if retry_btn:
+                n_retried = retry_failed_agents(sid, participants)
+                if n_retried == 0:
+                    st.info("No failed agents to retry in the last round.")
+                st.rerun()
+
+            # ── Final Synthesis trigger ───────────────────────────────────────
+            if final_synth_btn and round_participants:
+                with st.spinner("Running final synthesis round…"):
+                    run_round(sid, round_participants, _FINAL_SYNTHESIS_PROMPT,
+                              synthesize=True, round_label="🎯 Final Synthesis")
+                st.rerun()
+
+            # ── Stop / resume button (inline near message area) ──────────────
+            _stopped = st.session_state.get("relay_stop", False)
+            _sb_col1, _sb_col2 = st.columns([10, 1])
+            with _sb_col2:
+                if _stopped:
+                    if st.button("▶", key="resume_inline",
+                                 help="Resume auto-loop on next message",
+                                 use_container_width=True):
+                        st.session_state.relay_stop = False
+                        st.rerun()
+                else:
+                    if st.button("⏹", key="stop_inline",
+                                 help="Stop auto-loop after this round finishes",
+                                 use_container_width=True):
+                        st.session_state.relay_stop = True
+                        st.rerun()
+            with _sb_col1:
+                if _stopped:
+                    st.caption("⏹ Loop stopped — type a message to start a new round")
 
             # ── Chat input ────────────────────────────────────────────────────
             if user_input := st.chat_input("Message all agents…"):
                 file_attachment = st.session_state.pop(f"file_content_{sid}", None)
                 if file_attachment:
                     fname, ftext = file_attachment
-                    full_msg = f"[File: {fname}]\n```\n{ftext}\n```\n\n{user_input}" if user_input.strip() else f"[File: {fname}]\n```\n{ftext}\n```"
+                    # ftext is already formatted as [File: name]\n```...``` blocks.
+                    # Don't re-wrap: that produces double-nested code fences.
+                    full_msg = f"{ftext}\n\n{user_input}" if user_input.strip() else ftext
                 else:
                     full_msg = user_input
                 with st.chat_message("user", avatar="🧑"):
                     if file_attachment:
-                        st.caption(f"📎 {file_attachment[0]}")
+                        st.caption(f"📎 {fname}")
                     st.markdown(user_input)
-                if auto_rounds > 1:
-                    with st.spinner(f"Running {auto_rounds} rounds…"):
-                        run_auto_rounds(sid, participants, full_msg, int(auto_rounds), synthesize=synthesize)
+                # Sending a new message clears any pending stop so the new
+                # round runs the requested number of times.
+                st.session_state.relay_stop = False
+                if unlimited:
+                    run_auto_rounds(sid, round_participants, full_msg, None, synthesize=synthesize)
+                elif auto_rounds > 1:
+                    run_auto_rounds(sid, round_participants, full_msg,
+                                    int(auto_rounds), synthesize=synthesize)
                 else:
-                    run_round(sid, participants, full_msg, synthesize=synthesize)
+                    run_round(sid, round_participants, full_msg, synthesize=synthesize)
                 st.rerun()
 
     else:
@@ -877,7 +1517,8 @@ elif mode == "Agents":
     ea = st.session_state.edit_agent
 
     if ea is None:
-        mgr = get_manager()
+        mgr          = get_manager()
+        assigned_set = set(mgr.list_agents()) if mgr else set()
         st.header("Agents")
 
         # ── Chrome connection bar ─────────────────────────────────────────────
@@ -933,8 +1574,8 @@ elif mode == "Agents":
         # ── Per-agent rows ────────────────────────────────────────────────────
         for name, cfg in agents_cfg.items():
             is_browser = getattr(cfg, "mode", "api") == "browser"
-            has_tab    = mgr and mgr.has_agent(name) if is_browser else False
-            is_on      = agent_active(cfg)
+            has_tab    = is_browser and name in assigned_set
+            is_on      = has_tab if is_browser else _api_agent_active(cfg)
 
             with st.container(border=True):
                 c1, c2, c3, c4 = st.columns([5, 2, 1, 1])
@@ -953,8 +1594,46 @@ elif mode == "Agents":
                 with c2:
                     if is_browser and mgr:
                         if has_tab:
-                            if st.button("Unassign", key=f"ua_{name}", use_container_width=True):
-                                mgr.unassign(name); st.rerun()
+                            ua_col, hc_col = st.columns([1, 1])
+                            with ua_col:
+                                if st.button("Unassign", key=f"ua_{name}", use_container_width=True):
+                                    mgr.unassign(name); st.rerun()
+                            with hc_col:
+                                if st.button("⚡ Check", key=f"fhc_{name}", use_container_width=True,
+                                             help="Fast tab health check — no prompt sent"):
+                                    _set_agent_statuses({name: "Checking"})
+                                    try:
+                                        result = mgr.fast_health_check(name)
+                                        if result.get("ok"):
+                                            _set_agent_statuses({name: "Healthy"})
+                                            st.session_state.pop(f"hc_err_{name}", None)
+                                        else:
+                                            reason = result.get("reason", "Unknown error")
+                                            st.session_state[f"hc_err_{name}"] = reason
+                                            _set_agent_statuses({name: "Failed"})
+                                    except Exception as exc:
+                                        st.session_state[f"hc_err_{name}"] = str(exc)
+                                        _set_agent_statuses({name: "Failed"})
+                                    st.rerun()
+                            hc_err = st.session_state.pop(f"hc_err_{name}", None)
+                            if hc_err:
+                                st.error(hc_err)
+                            if st.button("🔬 Full Check", key=f"fullhc_{name}", use_container_width=True,
+                                         help="Sends 'health-ok' probe and verifies capture — slow"):
+                                _set_agent_statuses({name: "Checking"})
+                                try:
+                                    result = mgr.full_health_check(name)
+                                    if result.get("ok"):
+                                        _set_agent_statuses({name: "Healthy"})
+                                        st.session_state.pop(f"hc_err_{name}", None)
+                                    else:
+                                        reason = result.get("reason") or f"Response: {result.get('response','?')[:80]}"
+                                        st.session_state[f"hc_err_{name}"] = f"Full Check: {reason}"
+                                        _set_agent_statuses({name: "Failed"})
+                                except Exception as exc:
+                                    st.session_state[f"hc_err_{name}"] = f"Full Check error: {exc}"
+                                    _set_agent_statuses({name: "Failed"})
+                                st.rerun()
                         else:
                             site = site_for_agent(name)
                             is_claude = site and site.get("key") == "claude"
