@@ -711,13 +711,22 @@ _PAYLOAD_ECHO_PHRASES = [
 ]
 
 def _is_bad_capture(payload: str) -> bool:
-    """True for empty, known-failure, or prompt-echo payloads."""
+    """True for empty, known-failure, or prompt-echo payloads.
+
+    Echo phrases are only checked in the first 400 characters.  Sites like
+    Perplexity capture a text diff that can include the search query at the
+    top (which echoes relay instructions) followed by the real answer.  A
+    short preamble check catches genuine bad captures (nothing but the relay
+    prompt was returned) without discarding long valid responses that happen
+    to quote an instruction phrase deep in the answer.
+    """
     t = (payload or "").strip()
     if not t:
         return True
     if t.startswith(_FAILURE_PREFIXES):
         return True
-    return any(phrase in payload for phrase in _PAYLOAD_ECHO_PHRASES)
+    preamble = t[:400]
+    return any(phrase in preamble for phrase in _PAYLOAD_ECHO_PHRASES)
 
 def _validate_payload_quality(payload: str) -> "tuple[bool, str | None]":
     """Returns (is_valid, failure_reason).  Conservative — only rejects obvious bad captures."""
@@ -921,14 +930,25 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
             discard_reason: "str | None" = None
             quarantined    = False
 
-            # Reject stale DOM reads before they enter the relay as real content
-            if not validated and not _is_relay_failure(payload):
+            # Reject stale DOM reads before they enter the relay as real content --
+            # EXCEPT capture_method == "semantic_unconfirmed": browser_relay.py's
+            # grace-retry already gave the semantic count several extra chances to
+            # catch up before concluding it's stale, and only assigns this method
+            # when the count still never moved BUT the captured text itself is
+            # real, substantial, and not a known failure sentinel. Discarding that
+            # anyway was the actual bug behind the "8→8"/"0→0" false quarantines --
+            # a genuinely good reply thrown away because one counter was slow.
+            if (not validated and not _is_relay_failure(payload)
+                    and raw.get("capture_method") != "semantic_unconfirmed"):
                 pre = raw.get("pre_response_count", "?")
                 nw  = raw.get("new_response_index", "?")
                 discard_reason = (f"Stale DOM read — element count {pre}→{nw}, "
                                   f"new response not confirmed")
                 payload     = f"[Error: {discard_reason}]"
                 quarantined = True
+            elif not validated and raw.get("capture_method") == "semantic_unconfirmed":
+                _log.info(f"[sid={sid}, round={round_id}, agent={name}] "
+                         f"Lower-confidence capture kept (semantic_unconfirmed), not quarantined")
 
             # Quality validation — second line of defense (e.g. prompt echo)
             if not _is_relay_failure(payload):

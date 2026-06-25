@@ -56,12 +56,18 @@ accordingly. They were never meant to be mixed within one session.
    (sequentially, fast) then polls all of them in parallel for replies —
    total wait is ≈ the slowest agent, not the sum.
 4. Every reply comes back wrapped in a lineage envelope (`validated`,
-   `capture_method`, element-count bookkeeping) — `run_round` quarantines
-   anything that looks like a stale DOM read or a prompt echo before it's
-   ever treated as a real reply. Sentinel failures (`[Error: ...]`,
-   `[Timed out]`, etc. — see `_is_relay_failure`) are shown to the user as a
-   visible system notice, never cross-injected to other agents as if they
-   were real speech.
+   `capture_method`, element-count bookkeeping). Completion and submission
+   detection are checkpoint-based and best-effort, not instantaneous or
+   absolute: a site's stop-button-hidden signal and its new-message DOM node
+   are not atomic, so `_make_envelope` gives the element count a short grace
+   window (a few quick re-checks) to catch up before deciding anything is
+   stale. If it still never catches up but the captured text is clearly
+   real, it's kept and flagged `capture_method: "semantic_unconfirmed"`
+   (lower-confidence, visible in 🔍 Debug/Recovery) rather than discarded —
+   only genuinely empty, echoed, or sentinel-prefixed captures get
+   quarantined. Sentinel failures (`[Error: ...]`, `[Timed out]`, etc. — see
+   `_is_relay_failure`) are shown to the user as a visible system notice,
+   never cross-injected to other agents as if they were real speech.
 5. Only successful replies get cross-injected and fed to the synthesizer.
    Synthesis prefers reusing one of the round's already-replying browser
    agents (no extra API key/cost); falls back to a direct Anthropic API call
@@ -83,6 +89,12 @@ accordingly. They were never meant to be mixed within one session.
 
 ## Known limitations, stated plainly
 
+- Stop/completion detection (stop-button lifecycle, semantic element counts,
+  text-stability fallback) is checkpoint-based and best-effort, not
+  instantaneous or absolute. Every signal Relay uses is a snapshot at a
+  point in time, re-checked with short grace windows where the timing is
+  known to be tight (see `_make_envelope` in `browser_relay.py`) — but no
+  amount of re-checking makes a DOM observation equivalent to a guarantee.
 - The "Stop After Round" control checks a flag between loop iterations
   within one continuous Python call. Whether a click mid-run is guaranteed
   to land cleanly between rounds (rather than mid-round) depends on

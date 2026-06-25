@@ -12,8 +12,16 @@ No separate browser windows. No profiles. No anti-bot fights.
 import queue
 import threading
 import time
+import uuid as _uuid
 from pathlib import Path
 from typing import Optional
+
+try:
+    from relay_log import get_logger as _get_logger
+    _log = _get_logger("relay.browser")
+except Exception:
+    import logging
+    _log = logging.getLogger("relay.browser")
 
 CDP_URL = "http://localhost:9222"
 
@@ -22,6 +30,11 @@ SITES: dict[str, dict] = {
         "url":          "https://claude.ai/new",
         "url_match":    "claude.ai",
         "input":        [
+            # Target the contenteditable ProseMirror *inside* the chat-input
+            # wrapper first.  Selecting the wrapper div itself makes _did_clear
+            # fail: the wrapper's innerText includes placeholder/UI text even
+            # when the composer is empty, so _verify_sent always returns False.
+            '[data-testid="chat-input"] div[contenteditable="true"]',
             '[data-testid="chat-input"]',
             'div[contenteditable="true"].ProseMirror',
             ".ProseMirror",
@@ -29,6 +42,16 @@ SITES: dict[str, dict] = {
         ],
         "stop_btn":     '[aria-label="Stop"]',
         "send_btn":     '[data-testid="send-button"]',
+        # semantic_sel: one element per completed assistant turn.
+        # [data-testid="assistant-message"] was the old attribute; Claude's
+        # current DOM uses .font-claude-message as the per-turn wrapper.
+        # Listing both: whichever matches contributes to the element count,
+        # so a new reply always increases the sum regardless of which attr
+        # Claude ships in a given UI version.
+        "semantic_sel": [
+            '[data-testid="assistant-message"]',
+            '.font-claude-message',
+        ],
         "response_sel": [
             # Most specific first — target the prose body inside the assistant turn
             '[data-testid="assistant-message"] .prose-sm',
@@ -49,6 +72,8 @@ SITES: dict[str, dict] = {
         ],
         "stop_btn":     'button[data-testid="stop-button"]',
         "send_btn":     'button[data-testid="send-button"]',
+        # semantic_sel: one element per assistant turn — already the response_sel
+        "semantic_sel": ['[data-message-author-role="assistant"]'],
         "response_sel": '[data-message-author-role="assistant"]',
     },
     "gemini": {
@@ -60,6 +85,8 @@ SITES: dict[str, dict] = {
         ],
         "stop_btn":     'button[aria-label="Stop response"]',
         "send_btn":     'button[aria-label="Send message"]',
+        # semantic_sel: model-response is the custom element wrapping each reply
+        "semantic_sel": ["model-response"],
         # Gemini's model-response/message-content are Angular custom elements
         # that may use Shadow DOM. Playwright's css engine pierces OPEN shadow
         # roots automatically already (no special ">>"" syntax needed for
@@ -84,14 +111,48 @@ SITES: dict[str, dict] = {
             'textarea[placeholder*="Ask"]',
             'div[contenteditable="true"]',
         ],
-        "stop_btn":     'button[aria-label="Stop"]',
+        # Multiple stop-button selectors: Perplexity ships different aria-labels
+        # across versions ("Stop", "Stop generating", or none).  _verify_sent and
+        # _do_send_batch both accept a list here and try each in order.
+        "stop_btn": [
+            'button[aria-label="Stop"]',
+            'button[aria-label="Stop generating"]',
+            'button[aria-label="Stop responding"]',
+        ],
         "send_btn":     'button[aria-label="Submit"]',
+        # Perplexity navigates to perplexity.ai/search/... on submit, so the
+        # response DOM is on the NEW page, not the home page.  After navigation
+        # these selectors target the answer section specifically.
         "response_sel": [
-            ".prose",
+            # Specific data-testid selectors (most reliable when they match)
+            '[data-testid="thread-assistant-response"] .prose',
+            '[data-testid="answer"] .prose',
+            '[data-testid="thread-assistant-response"]',
+            '[data-testid="answer"]',
+            # Prose typography containers — Perplexity uses Tailwind `.prose` for
+            # the rendered markdown answer block.  Multiple matches → last wins
+            # (newest in the thread, not the query display at the top).
+            '.prose-base',
+            '.prose',
+            # Class-fragment fallbacks for versions that renamed the containers
+            "[class*='answer'] .prose",
             "[class*='answer-content']",
             "[class*='response-content']",
+            "[class*='answerBody']",
+            "[class*='answer_body']",
             ".answer-text",
             "[class*='answer']",
+            # Very broad last resort: readable text blocks excluding nav/header
+            'main div[dir="auto"]',
+            'div[dir="auto"]',
+        ],
+        # semantic_sel: one per completed answer block.
+        # These data-testid values have not matched Perplexity's current DOM;
+        # URL-change detection in _do_send_batch is the primary gate for
+        # Perplexity. These are kept as a best-effort secondary check.
+        "semantic_sel": [
+            '[data-testid="thread-assistant-response"]',
+            '[data-testid="answer"]',
         ],
     },
     "grok": {
@@ -204,39 +265,70 @@ def _clipboard_insert(page, message: str) -> bool:
         page.keyboard.press("Control+a")
         time.sleep(0.05)  # let selection register before paste
         page.keyboard.press("Control+v")
-        time.sleep(0.15)  # let the paste land in the DOM before nudging the framework
+        time.sleep(0.1)   # let the paste land in the DOM before nudging the framework
         _force_input_events(page)
         return True
     except Exception:
         return False
 
 
-def _did_clear(el) -> bool:
-    """True if the composer is now empty -- the universal "it actually sent" signal."""
+def _did_clear(el, page=None) -> bool:
+    """True if the composer is now empty -- the universal "it actually sent" signal.
+
+    Falls back to document.activeElement when el is stale (ProseMirror rebuilds
+    its own DOM nodes during and after a large paste, invalidating the reference
+    captured before the paste).
+    """
     try:
         return not (el.evaluate("e => (e.innerText || e.value || '').trim()"))
     except Exception:
+        if page:
+            try:
+                # Guard: only trust activeElement when it's a composer-like
+                # element.  document.body / buttons / the full page would have
+                # non-empty innerText and make this always return False even
+                # after a successful send.
+                return page.evaluate("""() => {
+                    const e = document.activeElement;
+                    if (!e) return false;
+                    const isComposer = e.contentEditable === 'true'
+                        || e.tagName === 'TEXTAREA'
+                        || (e.tagName === 'INPUT'
+                            && e.type !== 'button' && e.type !== 'submit');
+                    if (!isComposer) return false;
+                    return !(e.innerText || e.value || '').trim();
+                }""")
+            except Exception:
+                pass
         return False
 
 
-def _verify_sent(page, site: dict, el, pre_counts: dict, timeout: float = 2.5) -> bool:
+def _verify_sent(page, site: dict, el, pre_counts: dict, timeout: float = 4.0,
+                 pre_url: str = "") -> bool:
     """Fast post-submit check: did the composer clear, a stop button appear,
-    or a new response element show up? This is deliberately short (~2.5s),
-    distinct from _wait_and_read's long poll -- its job is letting
-    _type_and_submit detect a no-op click (wrong/disabled button) and retry
-    the next tier, not to wait out the model's actual response.
+    a URL navigation happen, or a new response element show up?
+
+    Timeout raised to 4 s (was 2.5 s) — large ProseMirror pastes can take
+    >2 s for Claude to show the stop button or clear the input.
+    Falls back to document.activeElement for the clear-check when el is stale.
     """
-    deadline = time.time() + timeout
-    stop_sel = site.get("stop_btn")
+    deadline  = time.time() + timeout
+    stop_sels = site.get("stop_btn")
+    if isinstance(stop_sels, str):
+        stop_sels = [stop_sels]
     while time.time() < deadline:
-        if _did_clear(el):
+        # Navigation = form submitted (e.g. Perplexity navigates after send)
+        if pre_url and page.url != pre_url:
             return True
-        if stop_sel:
-            try:
-                if page.locator(stop_sel).count() > 0:
-                    return True
-            except Exception:
-                pass
+        if _did_clear(el, page):
+            return True
+        if stop_sels:
+            for ss in stop_sels:
+                try:
+                    if page.locator(ss).count() > 0:
+                        return True
+                except Exception:
+                    pass
         try:
             cur_counts = _response_counts(page, site)
             if any(cur_counts.get(sel, 0) > n for sel, n in pre_counts.items()):
@@ -288,14 +380,25 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
                     message,
                 )
             _force_input_events(page)
-    time.sleep(0.5)
+    time.sleep(0.2)
     _save_debug(page, agent, "02_after_paste")
 
+    # Re-resolve element after paste — ProseMirror rebuilds its DOM nodes during
+    # large clipboard inserts, making the original `el` reference stale before
+    # we even try to click the send button.
+    try:
+        fresh = _resolve_selector(page, site["input"], timeout=800, prefer_latest=False)
+        if fresh:
+            el = fresh
+    except Exception:
+        pass  # keep original el if re-resolve fails
+
     pre_counts = _response_counts(page, site)
-    submitted = False
+    pre_url    = page.url  # capture URL for navigation-detection in _verify_sent
+    submitted  = False
 
     # Tier 1: configured send button. POLL for it to become enabled (up to
-    # ~2s) instead of checking once -- large pastes take the framework a
+    # ~3s) instead of checking once -- large pastes take the framework a
     # moment to re-render and enable the button, and a single early check
     # was the original failure: it saw "disabled" and gave up immediately.
     send_sel = site.get("send_btn")
@@ -303,18 +406,18 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
         try:
             btn = page.locator(send_sel)
             btn.first.wait_for(state="visible", timeout=3000)
-            deadline = time.time() + 2.0
+            deadline = time.time() + 3.0  # was 2.0 — some frameworks debounce longer
             while time.time() < deadline:
                 if btn.count() > 0 and btn.first.is_enabled():
                     btn.first.click()
                     submitted = True
                     break
-                time.sleep(0.2)
+                time.sleep(0.15)
         except Exception:
             pass
         if submitted:
             _save_debug(page, agent, "03_after_send_click")
-            if not _verify_sent(page, site, el, pre_counts):
+            if not _verify_sent(page, site, el, pre_counts, pre_url=pre_url):
                 submitted = False  # click was a no-op -- composer never cleared
 
     # Tier 2: JS fallback. Must filter for actual send/submit semantics and
@@ -358,7 +461,7 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
             pass
         if submitted:
             _save_debug(page, agent, "03_after_send_click")
-            if not _verify_sent(page, site, el, pre_counts):
+            if not _verify_sent(page, site, el, pre_counts, pre_url=pre_url):
                 submitted = False
 
     # Tier 3: keyboard submit chords, each verified before trying the next --
@@ -367,11 +470,15 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
     if not submitted:
         for chord in ("Enter", "Control+Enter", "Meta+Enter"):
             try:
-                el.click()
-                el.press(chord)
+                # Re-resolve element — may have become stale if ProseMirror
+                # rebuilt the node during Tier 1/2 attempts.
+                cur_el = _resolve_selector(page, site["input"], timeout=500,
+                                           prefer_latest=False) or el
+                cur_el.click()
+                cur_el.press(chord)
             except Exception:
                 continue
-            if _verify_sent(page, site, el, pre_counts, timeout=1.5):
+            if _verify_sent(page, site, el, pre_counts, timeout=2.0, pre_url=pre_url):
                 submitted = True
                 break
 
@@ -417,6 +524,27 @@ def _response_counts(page, site: dict) -> dict:
         resp_sels = [resp_sels]
     counts = {}
     for sel in resp_sels:
+        try:
+            counts[sel] = page.locator(sel).count()
+        except Exception:
+            counts[sel] = 0
+    return counts
+
+
+def _semantic_counts(page, site: dict) -> dict:
+    """Count completed assistant-turn containers using semantic selectors.
+
+    Semantic selectors target the top-level turn container (one per reply),
+    not child elements like prose blocks or code nodes. Falls back to
+    _response_counts when no semantic_sel is defined for the site.
+    """
+    sels = site.get("semantic_sel", [])
+    if not sels:
+        return _response_counts(page, site)
+    if isinstance(sels, str):
+        sels = [sels]
+    counts = {}
+    for sel in sels:
         try:
             counts[sel] = page.locator(sel).count()
         except Exception:
@@ -538,13 +666,16 @@ _UI_CHROME_PHRASES = [
     "Always verify important information",
 ]
 
-# Short, generic button/label words -- substring matching against these
-# silently dropped any real response line that happened to contain the word
-# (e.g. "Copy this snippet", "Share the dataset"). Exact whole-line match only.
+# Short, generic button/label words -- exact whole-line match only.
 _UI_CHROME_EXACT = {s.lower() for s in [
     "Copy", "Share", "Notify", "New conversation",
-    "Sonnet", "Opus", "Haiku", "Google AI",
+    "Share Copy", "Copy Share",
+    "Google AI",
 ]}
+
+# Model-selector labels appear as "Sonnet 4.6 Low", "Opus 4.8 Fast", etc. --
+# the version suffix varies so we prefix-match instead of exact-match.
+_UI_CHROME_PREFIXES = tuple(s.lower() for s in ["Sonnet", "Opus", "Haiku"])
 
 def _clean_diff(text: str) -> str:
     """Strip UI chrome from a page-text diff and return the response content."""
@@ -552,15 +683,137 @@ def _clean_diff(text: str) -> str:
     clean = []
     for line in lines:
         stripped = line.strip()
-        if stripped.lower() in _UI_CHROME_EXACT:
+        sl = stripped.lower()
+        if sl in _UI_CHROME_EXACT:
+            continue
+        if sl.startswith(_UI_CHROME_PREFIXES):
             continue
         if any(pat in stripped for pat in _UI_CHROME_PHRASES):
             continue
         clean.append(line)
-    # Drop leading/trailing blank lines and return
     result = "\n".join(clean).strip()
-    # If everything was stripped (very short response), return original
     return result if result else text.strip()
+
+
+def _make_envelope(agent: str, payload: str, pre_counts: dict,
+                   page, site, pre_method: str = "fallback",
+                   pre_url: str = "", grace_retries: int = 3,
+                   grace_interval: float = 0.25) -> dict:
+    """Wrap a scraped response in a lineage envelope.
+
+    Captures pre/post DOM element counts so app.py can reject stale reads
+    (cases where the response selector matched an OLD element instead of the
+    one the agent just generated). Agents never see this structure — app.py
+    strips it before cross-injection and display.
+
+    pre_url: the page URL before submission.  If the page navigated (e.g.
+    Perplexity home → search result) this counts as validated=True even when
+    semantic element counts are both 0, because the navigation itself is
+    unambiguous proof a submission happened.
+
+    grace_retries/grace_interval: the post-submission element count used to
+    be sampled exactly once. A site's stop-button-hidden event and the new
+    message's DOM node landing are not atomic -- under real load the new
+    element can appear tens to a few hundred ms after the signal that
+    triggered this call, comfortably past a single fixed-delay check. That
+    was the actual mechanism behind the reported "stale DOM read, element
+    count 8→8 / 0→0" false quarantines: a real reply was already captured by
+    _read_last_response, but the one-shot semantic recount hadn't caught up
+    yet. If the first sample shows no increase, re-sample a few more times
+    (well under 1s total added wait) before concluding it's genuinely stale.
+    """
+    pre_idx     = sum(pre_counts.values())
+    url_changed = bool(pre_url and page.url != pre_url)
+    warnings: list[str] = []
+
+    def _sample():
+        try:
+            if pre_method == "semantic" and site.get("semantic_sel"):
+                counts = _semantic_counts(page, site)
+                method = "semantic"
+            else:
+                counts = _response_counts(page, site)
+                method = "fallback"
+            return sum(counts.values()), method, None
+        except Exception as exc:
+            return pre_idx, "error", exc
+
+    new_idx, capture_method, err = _sample()
+    if err is not None:
+        warnings.append(f"Post-count error: {err}")
+
+    retries_used = 0
+    if not url_changed and new_idx <= pre_idx and capture_method != "error":
+        for _ in range(grace_retries):
+            time.sleep(grace_interval)
+            retries_used += 1
+            new_idx, capture_method, err = _sample()
+            if err is not None:
+                warnings.append(f"Post-count error on grace retry: {err}")
+                break
+            if new_idx > pre_idx:
+                warnings.append(
+                    f"Validated on grace retry #{retries_used} "
+                    f"({retries_used * grace_interval:.2f}s after first check)"
+                )
+                break
+
+    delta = new_idx - pre_idx
+    if delta > 1 and pre_method == "semantic":
+        warnings.append(
+            f"{delta} new semantic blocks appeared (pre={pre_idx}, post={new_idx}); "
+            f"captured newest"
+        )
+    if url_changed and new_idx <= pre_idx:
+        warnings.append(f"Validated via URL navigation ({pre_url!r} → {page.url!r}); "
+                        f"semantic count did not increase ({pre_idx}→{new_idx})")
+
+    validated = url_changed or new_idx > pre_idx
+
+    # Even after the grace window, the count may genuinely never increase
+    # (a real selector/DOM mismatch) while the payload text itself is real
+    # and substantial -- that's a lower-confidence capture, not the same
+    # thing as a genuinely empty/stale read. Distinguishing the two lets
+    # app.py keep good content instead of discarding it just because one
+    # specific counter never moved, while still flagging it for visibility.
+    if not validated and payload and payload.strip() and not payload.strip().startswith(
+        ("[Error:", "[Timed out]", "[No response captured", "[Not sent")
+    ):
+        capture_method = "semantic_unconfirmed"
+        warnings.append(
+            f"Semantic count never confirmed ({pre_idx}→{new_idx}) after "
+            f"{retries_used} grace retries, but payload text looks real — "
+            f"flagged lower-confidence rather than discarded"
+        )
+
+    return {
+        "event_id":           str(_uuid.uuid4()),
+        "round_id":           None,   # stamped by app.py after receipt
+        "agent":              agent,
+        "pre_response_count": pre_idx,
+        "new_response_index": new_idx,
+        "validated":          validated,
+        "capture_method":     capture_method,
+        "warnings":           warnings,
+        "timestamp":          time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "payload":            payload,
+    }
+
+
+def _error_envelope(agent: str, message: str) -> dict:
+    """Build an envelope for a setup/transport error (no DOM counts available)."""
+    return {
+        "event_id":           str(_uuid.uuid4()),
+        "round_id":           None,
+        "agent":              agent,
+        "pre_response_count": 0,
+        "new_response_index": 0,
+        "validated":          False,
+        "capture_method":     "error",
+        "warnings":           [],
+        "timestamp":          time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "payload":            message,
+    }
 
 
 def _read_last_response(page, site: dict) -> str:
@@ -593,11 +846,12 @@ class BrowserManager:
         self._pages: dict[str, object] = {}  # agent_name -> page
         self._cdp_sessions: list = []        # keep refs alive so listeners aren't GC'd
         self._browser = None
+        self._stopped = False  # set True by close() so alive goes False immediately
         self._thread  = threading.Thread(
             target=self._run, daemon=True, name="browser-manager"
         )
         self._thread.start()
-        status, val = self._ready_q.get(timeout=15)
+        status, val = self._ready_q.get(timeout=8)  # was 15 — CDP connect is nearly instant
         if status == "error":
             raise RuntimeError(val)
 
@@ -620,12 +874,13 @@ class BrowserManager:
                             pass
                     self._ready_q.put(("ok", None))
                 except Exception as e:
+                    _log.error(f"CDP connection failed ({CDP_URL}) — {e}", exc_info=True)
                     self._ready_q.put(("error", str(e)))
                     return
 
                 while True:
                     try:
-                        cmd = self._cmd_q.get(timeout=2)
+                        cmd = self._cmd_q.get(timeout=0.3)
                     except queue.Empty:
                         self._heartbeat()
                         continue
@@ -635,22 +890,38 @@ class BrowserManager:
 
                     action, agent, payload, res_q = cmd
                     try:
-                        if   action == "scan":       self._do_scan(res_q)
-                        elif action == "assign":     self._do_assign(agent, payload, res_q)
-                        elif action == "open_tab":   self._do_open_tab(agent, res_q)
-                        elif action == "send":       self._do_send(agent, payload, res_q)
-                        elif action == "send_batch": self._do_send_batch(payload, res_q)
+                        if   action == "scan":         self._do_scan(res_q)
+                        elif action == "assign":       self._do_assign(agent, payload, res_q)
+                        elif action == "open_tab":     self._do_open_tab(agent, res_q)
+                        elif action == "send":         self._do_send(agent, payload, res_q)
+                        elif action == "send_batch":   self._do_send_batch(payload, res_q)
+                        elif action == "fast_health":  self._do_fast_health(agent, res_q)
+                        elif action == "full_health":  self._do_full_health(agent, res_q)
                         elif action == "unassign":
                             self._pages.pop(agent, None)
                             res_q.put(("ok", None))
                         elif action == "list":
-                            res_q.put(("ok", list(self._pages.keys())))
+                            alive = [n for n, p in self._pages.items() if not p.is_closed()]
+                            res_q.put(("ok", alive))
+                        elif action == "duplicates":
+                            # Group agents by page object identity (id(page)).
+                            # Returns list of sets where each set has > 1 agent
+                            # sharing the same physical tab.
+                            from collections import defaultdict
+                            groups: dict = defaultdict(list)
+                            for n, p in self._pages.items():
+                                if not p.is_closed():
+                                    groups[id(p)].append(n)
+                            dupes = [sorted(v) for v in groups.values() if len(v) > 1]
+                            res_q.put(("ok", dupes))
                         elif action == "has":
                             page = self._pages.get(agent)
                             res_q.put(("ok", page is not None and not page.is_closed()))
                     except Exception as e:
+                        _log.error(f"[action={action}, agent={agent}] Unhandled dispatch error — {e}", exc_info=True)
                         res_q.put(("error", str(e)))
         except Exception as e:
+            _log.critical(f"BrowserManager thread crashed — {e}", exc_info=True)
             try:
                 self._ready_q.put(("error", str(e)))
             except Exception:
@@ -669,7 +940,17 @@ class BrowserManager:
         return pages
 
     def _do_scan(self, res_q):
-        tabs = [{"url": p.url, "title": p.title()} for p in self._all_pages()]
+        tabs = []
+        for p in self._all_pages():
+            try:
+                url = p.url
+            except Exception:
+                continue          # page is completely broken — skip it
+            try:
+                title = p.title() # CDP call — can hang on an unresponsive tab
+            except Exception:
+                title = ""        # title is display-only; don't stall the whole scan
+            tabs.append({"url": url, "title": title})
         res_q.put(("ok", tabs))
 
     def _do_assign(self, agent: str, page_index: int, res_q):
@@ -710,6 +991,76 @@ class BrowserManager:
             except Exception:
                 pass
             res_q.put(("error", str(e)))
+
+    def _do_fast_health(self, agent: str, res_q):
+        """Check tab existence, URL, input visibility — no prompt sent."""
+        page = self._pages.get(agent)
+        site = site_for_agent(agent)
+        result: dict = {"agent": agent, "ok": False, "reason": None}
+
+        if page is None or page.is_closed():
+            result["reason"] = "No tab assigned or tab was closed"
+            res_q.put(("ok", result))
+            return
+
+        url_match = (site or {}).get("url_match", "")
+        if url_match and url_match not in page.url:
+            result["reason"] = f"URL mismatch — expected '{url_match}', got '{page.url[:60]}'"
+            res_q.put(("ok", result))
+            return
+
+        if site is None:
+            result["reason"] = "Unknown site for this agent"
+            res_q.put(("ok", result))
+            return
+
+        try:
+            el = _resolve_selector(page, site.get("input", []), timeout=2000, prefer_latest=False)
+            if el is None:
+                result["reason"] = "Input box not visible or not found"
+                res_q.put(("ok", result))
+                return
+        except Exception as exc:
+            result["reason"] = f"Input check error: {exc}"
+            res_q.put(("ok", result))
+            return
+
+        result["ok"] = True
+        result["url"] = page.url[:80]
+        res_q.put(("ok", result))
+
+    def _do_full_health(self, agent: str, res_q):
+        """Send a tiny probe message and verify the response — slow path."""
+        _PROBE = "Reply with exactly these two words and nothing else: health-ok"
+        page = self._pages.get(agent)
+        site = site_for_agent(agent)
+        result: dict = {"agent": agent, "ok": False, "reason": None, "response": None}
+
+        if page is None or page.is_closed() or site is None:
+            result["reason"] = "No tab assigned or unknown site"
+            res_q.put(("ok", result))
+            return
+
+        try:
+            pre_counts = _semantic_counts(page, site)
+            _type_and_submit(page, site, _PROBE, agent)
+            response = _wait_and_read(page, site, timeout=30,
+                                      pre_len=len(_page_text(page)),
+                                      pre_counts=pre_counts, agent=agent)
+            result["response"] = response
+            # Accept any reply that includes "health" and isn't a failure sentinel
+            is_ok = bool(response) and "health" in response.lower()
+            is_ok = is_ok and not response.strip().startswith(
+                ("[Error:", "[Timed out]", "[No response", "[Not sent")
+            )
+            result["ok"] = is_ok
+            if not is_ok:
+                result["reason"] = f"Unexpected response: {response[:100]}"
+        except Exception as exc:
+            _log.error(f"[agent={agent}] Full health check error — {exc}", exc_info=True)
+            result["reason"] = f"Full health check error: {exc}"
+
+        res_q.put(("ok", result))
 
     def _do_send(self, agent: str, payload, res_q):
         page = self._pages.get(agent)
@@ -756,22 +1107,43 @@ class BrowserManager:
                 # real Chrome window-focus change with repaint/visibility-
                 # change overhead, multiplied by every agent, every round.
                 pre_len    = len(_page_text(page))
-                pre_counts = _response_counts(page, site)
+                pre_url    = page.url  # capture BEFORE submit for URL-change detection
+                pre_counts = _semantic_counts(page, site)
+                pre_method = "semantic" if site.get("semantic_sel") else "fallback"
                 _type_and_submit(page, site, msg, ag)
+                # For sites that navigate on submit (e.g. Perplexity home → search
+                # result), the pre_len measured on the old page is useless for the
+                # text-diff fallback.  Re-capture from the NEW page if the URL changed.
+                try:
+                    if page.url != site.get("url", page.url).rstrip("/"):
+                        page.wait_for_load_state("domcontentloaded", timeout=2000)
+                        pre_len    = len(_page_text(page))
+                        # NOTE: intentionally keep pre_counts from the old page
+                        # (all zeros for Perplexity home) so URL-change validation
+                        # in _make_envelope can detect that 0→0 happened on a
+                        # site that navigates, not a genuine capture failure.
+                except Exception:
+                    pass
                 state[ag] = {
                     "page": page, "site": site,
                     "pre_len": pre_len, "pre_counts": pre_counts,
+                    "pre_method": pre_method,
+                    "pre_url":  pre_url,  # URL before submit
                     "prev_len": pre_len,
                     "start": time.time(),
                     "deadline": time.time() + tout,
                     "stable": 0, "stop_seen": False, "new_el_seen": False,
-                    "el_check_at": time.time() + 3,  # first element check after 3s
+                    "el_check_at": time.time() + 1,  # first element check after 1s
                 }
             except Exception as e:
+                _log.error(f"[agent={ag}] Batch type/submit error — {e}", exc_info=True)
                 state[ag] = {"error": str(e)}
                 _save_debug(page, ag, "batch_02_type_error")
 
-        results = {a: f"[Error: {s['error']}]" for a, s in state.items() if "error" in s}
+        results = {
+            a: _error_envelope(a, f"[Error: {s['error']}]")
+            for a, s in state.items() if "error" in s
+        }
         pending  = [a for a in state if "error" not in state[a]]
 
         # Step 2: round-robin poll until every agent has replied.
@@ -790,36 +1162,58 @@ class BrowserManager:
                         cur  = _page_text(page)
                         diff = cur[s["pre_len"]:].strip()
                         resp = _clean_diff(diff) if diff else ""
-                    results[ag] = resp or "[Timed out]"
+                    results[ag] = _make_envelope(ag, resp or "[Timed out]",
+                                                 s["pre_counts"], page, site,
+                                                 s.get("pre_method", "fallback"),
+                                                 s.get("pre_url", ""))
                     _save_debug(page, ag, "batch_05_timeout")
                     continue
 
                 # ── Stop-button (cheapest: single locator count call)
-                stop_sel = site.get("stop_btn")
+                # stop_btn may be a string or list of strings (multiple aria-labels).
+                stop_sels = site.get("stop_btn") or []
+                if isinstance(stop_sels, str):
+                    stop_sels = [stop_sels]
                 stop_now = False
-                if stop_sel:
+                for _ss in stop_sels:
                     try:
-                        stop_now = page.locator(stop_sel).count() > 0
+                        if page.locator(_ss).count() > 0:
+                            stop_now = True
+                            break
                     except Exception:
                         pass
-                    if stop_now:
-                        s["stop_seen"] = True
-                    if s["stop_seen"] and not stop_now:
+                if stop_now:
+                    s["stop_seen"] = True
+                if s["stop_seen"] and not stop_now:
+                        # Brief DOM-commit settle: the stop button can disappear
+                        # a frame before the new message element is written to
+                        # the DOM (ChatGPT 8→8 symptom). 350 ms is enough for
+                        # any browser to flush its render queue after generation.
+                        time.sleep(0.35)
                         resp = _read_last_response(page, site)
                         if not resp:
                             resp = _clean_diff(_page_text(page)[s["pre_len"]:].strip())
-                        results[ag] = resp or "[No response captured]"
+                        results[ag] = _make_envelope(ag, resp or "[No response captured]",
+                                                     s["pre_counts"], page, site,
+                                                     s.get("pre_method", "fallback"),
+                                                     s.get("pre_url", ""))
                         continue
 
-                # ── Element-count gate — poll every 3s, no blind time fallback.
-                # The single-send fix (707ef5e) waits for element count to actually
-                # increase before the stability check starts.  Mirroring that here:
-                # a longer blind timeout treats the symptom; removing it fixes the
-                # cause — if no new element appears, there is no valid response yet.
+                # ── Element-count gate — also opens on URL change.
+                # Sites like Perplexity navigate from the home page to a search
+                # result page on submit.  Their semantic_sel selectors match the
+                # search page but not the home page, so pre_counts is always 0.
+                # A URL change is unambiguous proof that a new response context
+                # exists; treat it as equivalent to a semantic-element increase.
                 if not s["new_el_seen"]:
                     now = time.time()
-                    if now >= s["el_check_at"]:
-                        cur_counts = _response_counts(page, site)
+                    pre_url = s.get("pre_url", "")
+                    # URL-change gate: navigation = new response context
+                    if pre_url and page.url != pre_url:
+                        s["new_el_seen"]  = True
+                        s["stable_floor"] = 0  # anything that stops growing is done
+                    elif now >= s["el_check_at"]:
+                        cur_counts = _semantic_counts(page, site)
                         if any(cur_counts.get(sel, 0) > n
                                for sel, n in s["pre_counts"].items()):
                             s["new_el_seen"] = True
@@ -832,7 +1226,7 @@ class BrowserManager:
                             # timeout despite having finished immediately.
                             s["stable_floor"] = len(_page_text(page)) - 8
                         else:
-                            s["el_check_at"] = now + 3
+                            s["el_check_at"] = now + 1.5
                     still.append(ag)
                     s["prev_len"] = len(_page_text(page))
                     continue
@@ -841,15 +1235,16 @@ class BrowserManager:
                 cur_len = len(_page_text(page))
                 if cur_len == s["prev_len"] and cur_len > s["stable_floor"]:
                     s["stable"] += 1
-                    if s["stable"] >= 4:
+                    if s["stable"] >= 3:
                         resp = _read_last_response(page, site)
                         if not resp:
                             resp = _clean_diff(_page_text(page)[s["pre_len"]:].strip())
-                        if resp:
-                            results[ag] = resp
-                        else:
-                            results[ag] = "[No response captured]"
+                        if not resp:
                             _save_debug(page, ag, "batch_04_no_response")
+                        results[ag] = _make_envelope(ag, resp or "[No response captured]",
+                                                     s["pre_counts"], page, site,
+                                                     s.get("pre_method", "fallback"),
+                                                     s.get("pre_url", ""))
                         continue
                 else:
                     s["stable"] = 0
@@ -858,7 +1253,7 @@ class BrowserManager:
 
             pending = still
             if pending:
-                time.sleep(1)
+                time.sleep(0.75)
 
         res_q.put(("ok", results))
 
@@ -873,7 +1268,10 @@ class BrowserManager:
         return val
 
     def scan_tabs(self) -> list[dict]:
-        return self._call("scan", timeout=5)
+        try:
+            return self._call("scan", timeout=10)  # was 5; title() can be slow
+        except Exception:
+            return []
 
     def assign_tab(self, agent: str, tab_index: int) -> None:
         self._call("assign", agent, tab_index, timeout=5)
@@ -901,6 +1299,32 @@ class BrowserManager:
         except Exception:
             return False
 
+    def list_agents(self) -> list[str]:
+        """Return names of all currently-assigned, non-closed agents in one call."""
+        try:
+            return self._call("list", timeout=5)
+        except Exception:
+            return []
+
+    def find_duplicate_tabs(self) -> list[list[str]]:
+        """Return a list of agent-name groups that share a single Chrome tab.
+
+        Each group is a sorted list of 2+ agent names assigned to the same page
+        object.  Empty list means no conflicts.
+        """
+        try:
+            return self._call("duplicates", timeout=5)
+        except Exception:
+            return []
+
+    def fast_health_check(self, agent: str) -> dict:
+        """Tab-only preflight: no prompt sent. Returns {ok, reason, url}."""
+        return self._call("fast_health", agent, timeout=8)
+
+    def full_health_check(self, agent: str) -> dict:
+        """Send 'health-ok' probe and verify capture. Returns {ok, reason, response}."""
+        return self._call("full_health", agent, timeout=60)
+
     def unassign(self, agent: str) -> None:
         try:
             self._call("unassign", agent, timeout=3)
@@ -914,9 +1338,16 @@ class BrowserManager:
             return []
 
     def close(self) -> None:
-        self._cmd_q.put(None)
-        self._thread.join(timeout=5)
+        """Signal the browser thread to exit. Returns immediately — does not block.
+
+        _stopped is set True first so alive goes False right away, letting the
+        Streamlit UI rerender without waiting for Playwright's CDP cleanup.
+        The thread exits in the background within ~0.3s (next idle poll tick).
+        """
+        self._stopped = True
+        self._pages.clear()          # release page refs — list_agents returns [] instantly
+        self._cmd_q.put(None)        # wake the thread so it exits promptly
 
     @property
     def alive(self) -> bool:
-        return self._thread.is_alive()
+        return not self._stopped and self._thread.is_alive()
