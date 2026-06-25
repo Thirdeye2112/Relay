@@ -1737,7 +1737,7 @@ if mode == "Conversations":
 
                 ctrl1, ctrl2, ctrl3, ctrl4, ctrl5, ctrl6, ctrl7, ctrl8 = st.columns(8)
                 with ctrl1:
-                    synthesize = st.toggle("🔮 Synthesize", value=True, key=_k_synth)
+                    synthesize = st.toggle("🔮 Synthesize", value=False, key=_k_synth)
                 with ctrl2:
                     stop_btn = st.button("⏹ Stop After Round", use_container_width=True)
                     if stop_btn:

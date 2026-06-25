@@ -383,6 +383,38 @@ Fix, entirely in `app.py` (no `browser_relay.py` changes):
   After Round") against a real Chrome instance to confirm the UI now shows
   the disabled state / cached agent list instead of stalling or misreporting.
 
+## Synthesize toggle now defaults OFF (this pass)
+
+User reported the gap between rounds felt "super slow" and expected it to
+be near-instant once every agent has answered. Traced it: with the
+🔮 Synthesize toggle on (it defaulted to `True`), `run_round` makes one
+*additional* full LLM round-trip after every round — sending a synthesis
+prompt to one of the browser agents via `mgr.send_message` (`app.py`
+`run_synthesis`, called from `run_round` ~line 1330) — before returning and
+letting the next round start. This can't be hidden or run in parallel: it's
+the same single CDP connection / single worker thread used by every other
+agent, so it's strictly sequential with the next round's send, by the
+project's own one-connection, no-thread-pool design. So with Synthesize on,
+"time between rounds" always includes one extra full generation, on top of
+whatever the slowest agent in the round took.
+
+Fix: flipped the toggle's default from `value=True` to `value=False`
+(`st.toggle("🔮 Synthesize", value=False, key=_k_synth)`, ~line 1740). Users
+who want the synthesis paragraph can still turn it on per-session; auto-loop
+rounds are now instant-by-default as soon as every agent's reply lands,
+matching the explicit ask. The two explicit "🎯 Final Synthesis" /
+"📋 Task Assignment" buttons elsewhere still pass `synthesize=True` directly
+regardless of this toggle — those are deliberate one-off user actions, not
+the per-round default path, so leaving them unconditional is correct.
+
+Secondary, smaller cost noted but not changed: every Streamlit rerun calls
+`render_display(sid)`, which re-parses and re-renders the *entire*
+`display.jsonl` transcript from scratch (not just the newest round), so
+per-rerun rendering cost grows slowly with conversation length. Not touched
+in this pass — flagged here in case a long-running auto-loop session
+(hundreds of rounds) is ever reported as slow again after this fix; that
+would point at this, not synthesis.
+
 ## Verification limitations (this pass)
 
 This sandbox has no live Chrome instance or `claude.ai/code` tab, so the
