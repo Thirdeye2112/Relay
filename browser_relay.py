@@ -1147,6 +1147,7 @@ class BrowserManager:
         # transport/safety decision, so plain dict read/write is fine here.
         self._batch_progress: dict[str, bool] = {}
         self._cdp_sessions: list = []        # keep refs alive so listeners aren't GC'd
+        self._bg_tasks: set = set()          # strong refs for fire-and-forget tasks (see _spawn)
         self._browser = None
         self._stopped = False  # set True by close() so alive goes False immediately
         self._thread  = threading.Thread(
@@ -1181,7 +1182,7 @@ class BrowserManager:
                         await ctx.add_init_script(
                             "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
                         )
-                        ctx.on("page", lambda page: asyncio.ensure_future(self._arm_auto_resume(page)))
+                        ctx.on("page", lambda page: self._spawn(self._arm_auto_resume(page)))
                     except Exception:
                         pass
                 self._ready_q.put(("ok", None))
@@ -1233,6 +1234,18 @@ class BrowserManager:
                 except Exception as e:
                     _log.error(f"[action={action}, agent={agent}] Unhandled dispatch error — {e}", exc_info=True)
                     res_q.put(("error", str(e)))
+
+    def _spawn(self, coro) -> None:
+        """Fire-and-forget a coroutine from a sync Playwright event callback
+        (ctx.on("page", ...), cdp.on("Debugger.paused", ...)). asyncio only
+        keeps a *weak* reference to a bare ensure_future() task -- with
+        nothing else holding it, the task can be garbage-collected before it
+        finishes running, which would mean a debugger-pause auto-resume (or
+        the page-armed handler itself) silently never completes. Stash a
+        strong ref here and drop it once the task is done."""
+        task = asyncio.ensure_future(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
 
     def _resolve_site(self, agent: str) -> Optional[dict]:
         """site_for_agent, but honoring any explicit override set via assign_tab/open_tab."""
@@ -1303,7 +1316,7 @@ class BrowserManager:
                 except Exception:
                     pass
 
-            cdp.on("Debugger.paused", lambda evt=None: asyncio.ensure_future(_resume(evt)))
+            cdp.on("Debugger.paused", lambda evt=None: self._spawn(_resume(evt)))
             self._cdp_sessions.append(cdp)  # prevent garbage collection
         except Exception:
             pass
@@ -1555,6 +1568,19 @@ class BrowserManager:
             """
             s = state[ag]
             page, site = s["page"], s["site"]
+            try:
+                return await _poll_loop(ag, s, page, site)
+            except Exception as e:
+                # A closed/crashed tab (or any other unexpected error) must not
+                # take down the whole batch via asyncio.as_completed -- it would
+                # otherwise abort every other agent's already-in-flight poll too.
+                # Surface it as this agent's own transport_failure instead.
+                _log.error(f"[agent={ag}] Batch poll error — {e}", exc_info=True)
+                env = _error_envelope(ag, f"[Error: {e}]", failure_stage="transport",
+                                       site_key=(site or {}).get("key", ""))
+                return ag, env
+
+        async def _poll_loop(ag, s, page, site):
             while True:
                 if time.time() > s["deadline"]:
                     resp = await _read_last_response(page, site)

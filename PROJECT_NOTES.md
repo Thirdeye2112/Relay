@@ -79,6 +79,29 @@ API-only CLI with its own canonical-transcript engine — see README.md's
   surfaced as "switching to Agents and clicking Find Tab hangs." Each
   call is now capped at 2s (`asyncio.wait_for(..., timeout=2.0)`) so a
   bad tab costs a few seconds, not an indefinite stall.
+- **`_poll_one` (in `_do_send_batch`) guards each agent's wait loop with its
+  own try/except.** Without it, a closed/crashed tab mid-batch (e.g. the
+  user closes an assigned tab while a round is running) raises out of one
+  agent's coroutine, through `asyncio.as_completed`'s `await fut`, and
+  aborts the *entire* batch — every other agent's already-captured result
+  is lost, not just the broken one's. This bug pre-dated the async
+  migration (the old sync round-robin `while pending:` loop had the same
+  gap), but the async rewrite was the right moment to fix it: each
+  `_poll_one(ag)` now delegates to `_poll_loop(ag, s, page, site)` inside a
+  try/except that turns any exception into that one agent's own
+  `transport_failure` envelope (`failure_stage="transport"`) and lets
+  every other agent's task keep running undisturbed.
+- **Fire-and-forget event-handler coroutines use `_spawn`, not a bare
+  `asyncio.ensure_future`.** `ctx.on("page", ...)` (arms auto-resume on
+  every new tab) and `cdp.on("Debugger.paused", ...)` (the actual
+  auto-resume) both fire from synchronous Playwright event callbacks and
+  schedule a coroutine with nothing else awaiting it. A bare
+  `asyncio.ensure_future(...)` result with no other reference can be
+  garbage-collected mid-execution — silently dropping the debugger
+  auto-resume, the exact thing it exists to guarantee. `BrowserManager._spawn`
+  stashes the task in `self._bg_tasks` and clears it via a done-callback,
+  mirroring the existing `self._cdp_sessions.append(cdp)` "keep it alive"
+  pattern already used for the CDP session object itself.
 - **`site_key` override beats name inference, always.** `site_for_agent`
   infers a site from an agent's name only when no explicit `site_key` is
   set, and that inference always maps any "claude"-containing name to
