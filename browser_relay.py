@@ -591,6 +591,8 @@ class BrowserManager:
         self._cmd_q   = queue.Queue()
         self._ready_q = queue.Queue()
         self._pages: dict[str, object] = {}  # agent_name -> page
+        self._tab_ids: dict[str, str] = {}   # agent_name -> bound CDP targetId
+        self._tabid_cache: dict[int, str] = {}  # id(page) -> targetId (computed once)
         self._cdp_sessions: list = []        # keep refs alive so listeners aren't GC'd
         self._browser = None
         self._thread  = threading.Thread(
@@ -643,9 +645,22 @@ class BrowserManager:
                         elif action == "send_batch": self._do_send_batch(payload, res_q)
                         elif action == "unassign":
                             self._pages.pop(agent, None)
+                            self._tab_ids.pop(agent, None)
                             res_q.put(("ok", None))
                         elif action == "list":
                             res_q.put(("ok", list(self._pages.keys())))
+                        elif action == "assignments":
+                            res_q.put(("ok", self._assignments()))
+                        elif action == "identity_ok":
+                            res_q.put(("ok", self._identity_ok(agent)))
+                        elif action == "front":
+                            page = self._pages.get(agent)
+                            if page is not None and not page.is_closed():
+                                try:
+                                    page.bring_to_front()
+                                except Exception:
+                                    pass
+                            res_q.put(("ok", None))
                         elif action == "has":
                             page = self._pages.get(agent)
                             res_q.put(("ok", page is not None and not page.is_closed()))
@@ -661,6 +676,78 @@ class BrowserManager:
         dead = [n for n, p in self._pages.items() if p.is_closed()]
         for n in dead:
             self._pages.pop(n, None)
+            self._tab_ids.pop(n, None)
+
+    def _target_id(self, page) -> Optional[str]:
+        """Stable CDP targetId for a tab — survives reloads/route changes, so it
+        is the binding key (never a list index, which shifts when tabs open or
+        close). Computed once per page and cached; a tab that is closed and
+        reopened mints a NEW targetId, which is exactly how identity_ok detects
+        a stale binding instead of silently re-pairing to a stray tab.
+        """
+        if page is None:
+            return None
+        k = id(page)
+        if k in self._tabid_cache:
+            return self._tabid_cache[k]
+        tid = None
+        try:
+            cdp = page.context.new_cdp_session(page)
+            try:
+                tid = cdp.send("Target.getTargetInfo")["targetInfo"]["targetId"]
+            finally:
+                try:
+                    cdp.detach()
+                except Exception:
+                    pass
+        except Exception:
+            tid = None
+        self._tabid_cache[k] = tid
+        return tid
+
+    def _page_for_tab_id(self, tab_id: str):
+        for page in self._all_pages():
+            try:
+                if self._target_id(page) == tab_id:
+                    return page
+            except Exception:
+                continue
+        return None
+
+    def _assignments(self) -> dict:
+        """agent -> bound tab_id, computed live so the UI renders ownership from
+        the manager's reverse view (single source of truth), never a separate
+        UI-side guess that can disagree with the actual bindings."""
+        out = {}
+        for ag, page in self._pages.items():
+            try:
+                if page is not None and not page.is_closed():
+                    out[ag] = self._tab_ids.get(ag) or self._target_id(page)
+            except Exception:
+                out[ag] = self._tab_ids.get(ag)
+        return out
+
+    def _identity_ok(self, agent: str) -> bool:
+        """True only if the agent's bound tab is still present and still uniquely
+        theirs. Fail-closed: a closed tab, a vanished targetId, or a tab now
+        claimed by another agent all return False rather than rebinding."""
+        page = self._pages.get(agent)
+        if page is None:
+            return False
+        try:
+            if page.is_closed():
+                return False
+        except Exception:
+            return False
+        bound = self._tab_ids.get(agent)
+        if bound is not None:
+            # The live tab must still carry the targetId we bound to.
+            if self._target_id(page) != bound:
+                return False
+            if self._page_for_tab_id(bound) is None:
+                return False
+        # No other agent may own this same page.
+        return self._claimed_by_other(agent, page) is None
 
     def _all_pages(self) -> list:
         pages = []
@@ -670,7 +757,16 @@ class BrowserManager:
         return pages
 
     def _do_scan(self, res_q):
-        tabs = [{"url": p.url, "title": p.title()} for p in self._all_pages()]
+        tabs = []
+        for p in self._all_pages():
+            try:
+                tabs.append({
+                    "tab_id": self._target_id(p),
+                    "url":    p.url,
+                    "title":  p.title(),
+                })
+            except Exception:
+                continue
         res_q.put(("ok", tabs))
 
     def _claimed_by_other(self, agent: str, page) -> Optional[str]:
@@ -685,22 +781,26 @@ class BrowserManager:
                 return other
         return None
 
-    def _do_assign(self, agent: str, page_index: int, res_q):
-        pages = self._all_pages()
-        if 0 <= page_index < len(pages):
-            page = pages[page_index]
-            # One tab per persona: refuse to bind a tab already owned by another
-            # agent. Without this two Claude personas (all url_match "claude.ai")
-            # could share one tab -- routing one persona's payload into the
-            # other's system-primed window and crediting one bubble to both.
-            other = self._claimed_by_other(agent, page)
-            if other:
-                res_q.put(("error", f"Tab already assigned to {other}"))
-                return
-            self._pages[agent] = page
-            res_q.put(("ok", None))
-        else:
-            res_q.put(("error", f"Tab index {page_index} out of range"))
+    def _do_assign(self, agent: str, tab_id: str, res_q):
+        """Bind by stable tab_id (CDP targetId), never a list index — an index
+        into a live snapshot shifts the instant a tab opens/closes, so "assign
+        index 2" could silently land on a different page than the one clicked.
+        """
+        page = self._page_for_tab_id(tab_id)
+        if page is None:
+            res_q.put(("error", "That tab is no longer open — rescan and pick it again."))
+            return
+        # One tab per persona: refuse to bind a tab already owned by another
+        # agent. Without this two Claude personas (all url_match "claude.ai")
+        # could share one tab -- routing one persona's payload into the
+        # other's system-primed window and crediting one bubble to both.
+        other = self._claimed_by_other(agent, page)
+        if other:
+            res_q.put(("error", f"Tab already assigned to {other}"))
+            return
+        self._pages[agent] = page
+        self._tab_ids[agent] = tab_id
+        res_q.put(("ok", None))
 
     def _do_find_assign(self, agent: str, payload, res_q):
         """Atomically find and bind the first eligible tab in ONE snapshot.
@@ -724,6 +824,7 @@ class BrowserManager:
                 continue
             if url_match in url:
                 self._pages[agent] = page
+                self._tab_ids[agent] = self._target_id(page)
                 res_q.put(("ok", url))
                 return
         res_q.put(("ok", None))
@@ -751,6 +852,7 @@ class BrowserManager:
             # Assign after goto so a failed navigation doesn't leave a broken entry.
             page.goto(site["url"], wait_until="commit", timeout=15_000)
             self._pages[agent] = page
+            self._tab_ids[agent] = self._target_id(page)
             res_q.put(("ok", None))
         except Exception as e:
             try:
@@ -763,6 +865,12 @@ class BrowserManager:
         page = self._pages.get(agent)
         if page is None or page.is_closed():
             res_q.put(("error", f"No tab assigned to '{agent}' — assign one in Agents."))
+            return
+        # Pre-send identity check (fail-closed): the bound tab must still be
+        # present and still uniquely this agent's. A stale binding halts the
+        # send rather than typing one persona's prompt into another's tab.
+        if not self._identity_ok(agent):
+            res_q.put(("error", f"binding lost for '{agent}' — re-assign in Agents."))
             return
         site = site_for_agent(agent)
         if site is None:
@@ -793,6 +901,11 @@ class BrowserManager:
             if page is None or page.is_closed() or site is None:
                 state[ag] = {"error": "No tab assigned or unknown site"}
                 _save_debug(page, ag, "batch_02_no_tab") if page else None
+                continue
+            # Fail-closed identity check before typing: a stale/duplicated
+            # binding must not land this agent's prompt in another's tab.
+            if not self._identity_ok(ag):
+                state[ag] = {"error": f"binding lost for '{ag}' — re-assign in Agents."}
                 continue
             try:
                 # No bring_to_front() here -- CDP dispatches input events
@@ -923,8 +1036,30 @@ class BrowserManager:
     def scan_tabs(self) -> list[dict]:
         return self._call("scan", timeout=5)
 
-    def assign_tab(self, agent: str, tab_index: int) -> None:
-        self._call("assign", agent, tab_index, timeout=5)
+    def assign_tab(self, agent: str, tab_id: str) -> None:
+        """Bind an agent to a tab by its stable tab_id (from scan_tabs())."""
+        self._call("assign", agent, tab_id, timeout=5)
+
+    def assignments(self) -> dict:
+        """agent -> bound tab_id, live from the manager's reverse view."""
+        try:
+            return self._call("assignments", timeout=5)
+        except Exception:
+            return {}
+
+    def identity_ok(self, agent: str) -> bool:
+        """True if the agent's bound tab is still present and uniquely theirs."""
+        try:
+            return self._call("identity_ok", agent, timeout=5)
+        except Exception:
+            return False
+
+    def bring_to_front(self, agent: str) -> None:
+        """Surface the agent's bound tab so the operator can confirm it."""
+        try:
+            self._call("front", agent, timeout=5)
+        except Exception:
+            pass
 
     def find_and_assign(self, agent: str, url_match: str,
                         exclude_substr: Optional[str] = None) -> Optional[str]:

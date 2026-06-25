@@ -212,13 +212,33 @@ def connect_browser() -> None:
 # url contains it before the url_match / already-claimed checks.
 _EXCLUDED_TAB_SUBSTR = "claude.ai/code"
 
+def _claude_chat_tab_count(m: "BrowserManager") -> int:
+    """Count open claude.ai chat tabs (excluding the code surface). When more
+    than one is open, two visually-identical chat tabs (e.g. two accounts)
+    cannot be told apart by URL — account identity is not programmatically
+    knowable — so auto-assign must defer to operator-confirmed Find Tab."""
+    try:
+        tabs = m.scan_tabs()
+    except Exception:
+        return 0
+    return sum(
+        1 for t in tabs
+        if "claude.ai" in t.get("url", "") and _EXCLUDED_TAB_SUBSTR not in t.get("url", "")
+    )
+
 def auto_assign_tabs(m: "BrowserManager") -> None:
     """Scan open tabs and assign each browser agent to the first matching tab.
 
     Uses find_and_assign so the find-and-bind happens atomically per agent in a
     single worker snapshot. The already-claimed guard inside it means two Claude
     personas (all url_match "claude.ai") can never land on the same tab.
+
+    Auto-assign is DISABLED for Claude personas when more than one claude.ai chat
+    tab is open: identical chat tabs from two accounts can't be distinguished by
+    URL, so binding them is the operator's explicit call (per-persona Find Tab),
+    not a guess. Non-Claude single-tab providers still auto-assign.
     """
+    claude_ambiguous = _claude_chat_tab_count(m) > 1
     for name, cfg in agents_cfg.items():
         if getattr(cfg, "mode", "api") != "browser":
             continue
@@ -226,6 +246,8 @@ def auto_assign_tabs(m: "BrowserManager") -> None:
             continue
         site = site_for_agent(name)
         if not site:
+            continue
+        if site.get("key") == "claude" and claude_ambiguous:
             continue
         try:
             m.find_and_assign(name, site["url_match"], exclude_substr=_EXCLUDED_TAB_SUBSTR)
@@ -236,15 +258,20 @@ def find_tab_for_agent(m: "BrowserManager", agent_name: str) -> str | None:
     """Find an open tab matching this agent and assign it. Returns tab URL or None.
 
     Honors the already-claimed guard inside find_and_assign so a persona can
-    never bind a tab another persona already owns.
+    never bind a tab another persona already owns. On success the bound tab is
+    brought to front so the operator can confirm which visible tab (which
+    account) was claimed.
     """
     site = site_for_agent(agent_name)
     if not site:
         return None
     try:
-        return m.find_and_assign(agent_name, site["url_match"], exclude_substr=_EXCLUDED_TAB_SUBSTR)
+        url = m.find_and_assign(agent_name, site["url_match"], exclude_substr=_EXCLUDED_TAB_SUBSTR)
     except Exception:
         return None
+    if url:
+        m.bring_to_front(agent_name)
+    return url
 
 def disconnect_browser() -> None:
     m = st.session_state.pop("browser_manager", None)
@@ -974,6 +1001,31 @@ elif mode == "Agents":
                         )
                     else:
                         st.error(err)
+
+        # ── Duplicate-binding banner (rendered from the manager's reverse view,
+        # the single source of truth — not a separate UI-side guess). The assign
+        # guard makes duplicates unreachable through the UI, so this is defensive
+        # insurance: if any tab_id is ever owned by >1 agent, surface it loudly.
+        if mgr:
+            try:
+                owners: dict = {}
+                for ag, tab_id in mgr.assignments().items():
+                    if tab_id:
+                        owners.setdefault(tab_id, []).append(ag)
+                dupes = [ags for ags in owners.values() if len(ags) > 1]
+                for ags in dupes:
+                    names = " and ".join(a.upper() for a in ags)
+                    st.error(
+                        f"⚠️ Duplicate tab binding: {names} share one Chrome tab. "
+                        "Go to that row → Unassign one, then Find Tab a different claude.ai tab."
+                    )
+                if _claude_chat_tab_count(mgr) > 1:
+                    st.caption(
+                        "Multiple claude.ai tabs open — assign each Claude persona with **Find Tab** "
+                        "(auto-assign is off for Claude so accounts aren't mixed up)."
+                    )
+            except Exception:
+                pass
 
         st.divider()
         if not agents_cfg:
