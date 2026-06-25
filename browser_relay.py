@@ -1085,6 +1085,11 @@ class BrowserManager:
         self._ready_q = queue.Queue()
         self._pages: dict[str, object] = {}  # agent_name -> page
         self._site_overrides: dict[str, str] = {}  # agent_name -> explicit site_key (e.g. "claude_code")
+        # Best-effort, UI-only progress snapshot for the in-flight send_batch call --
+        # written by the worker thread as each agent finishes, read (unlocked) by the
+        # Streamlit thread to update the "Waiting for…" spinner text. Not used for any
+        # transport/safety decision, so plain dict read/write is fine here.
+        self._batch_progress: dict[str, bool] = {}
         self._cdp_sessions: list = []        # keep refs alive so listeners aren't GC'd
         self._browser = None
         self._stopped = False  # set True by close() so alive goes False immediately
@@ -1384,6 +1389,7 @@ class BrowserManager:
         Wall-clock time ≈ slowest individual response, not the sum.
         All Playwright calls stay on this single thread — no thread-safety risk.
         """
+        self._batch_progress = {ag: False for ag in payloads}
         # Step 1: type + submit to every agent in turn (~1-2s each)
         state = {}
         for ag, (msg, tout) in payloads.items():
@@ -1450,6 +1456,8 @@ class BrowserManager:
                                site_key=(s.get("site") or {}).get("key", ""))
             for a, s in state.items() if "error" in s
         }
+        for a in results:
+            self._batch_progress[a] = True
         pending  = [a for a in state if "error" not in state[a]]
 
         # Step 2: round-robin poll until every agent has replied.
@@ -1474,6 +1482,7 @@ class BrowserManager:
                                                  s.get("pre_url", ""),
                                                  timing={**s.get("submit_timing", {}),
                                                          "wait_response_ms": int((time.time() - s["start"]) * 1000)})
+                    self._batch_progress[ag] = True
                     _save_debug(page, ag, "batch_05_timeout")
                     continue
 
@@ -1507,6 +1516,7 @@ class BrowserManager:
                                                      s.get("pre_url", ""),
                                                      timing={**s.get("submit_timing", {}),
                                                              "wait_response_ms": int((time.time() - s["start"]) * 1000)})
+                        self._batch_progress[ag] = True
                         continue
 
                 # ── Element-count gate — also opens on URL change.
@@ -1557,6 +1567,7 @@ class BrowserManager:
                                                      s.get("pre_url", ""),
                                                      timing={**s.get("submit_timing", {}),
                                                              "wait_response_ms": int((time.time() - s["start"]) * 1000)})
+                        self._batch_progress[ag] = True
                         continue
                 else:
                     s["stable"] = 0
@@ -1612,6 +1623,15 @@ class BrowserManager:
         full_payloads = {a: (msg, timeout) for a, msg in payloads.items()}
         max_wait = timeout + len(payloads) * 5 + 30
         return self._call("send_batch", payload=full_payloads, timeout=max_wait)
+
+    def batch_progress(self) -> dict:
+        """Best-effort snapshot of {agent: done} for the in-flight (or most
+        recent) send_batch call -- lets the caller poll which agents have
+        already replied while still blocked waiting on the rest. Read from
+        another thread without locking; this is UI feedback only, never used
+        for a transport/safety decision, so a stale or torn read is harmless.
+        """
+        return dict(self._batch_progress)
 
     def has_agent(self, agent: str) -> bool:
         try:

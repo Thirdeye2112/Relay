@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """relay/app.py — Run: python -m streamlit run app.py"""
 
-import os, sys, json, datetime, time
+import os, sys, json, datetime, time, threading
 from typing import Optional
 import streamlit as st
 from pathlib import Path
@@ -1056,14 +1056,46 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
     # ── Browser agents — submit all at once, wait in parallel ─────────────────
     if browser_agents and payloads and mgr:
         _set_agent_statuses({n: "Sending" for n in browser_agents})
-        agent_list = ", ".join(payloads.keys())
-        with st.spinner(f"Waiting for {agent_list}…"):
+        agent_names = list(payloads.keys())
+
+        # send_batch() itself only returns once EVERY agent is done -- it
+        # doesn't trickle results out as they land. Run it on a plain Python
+        # thread (it just blocks on BrowserManager's command queue; no
+        # Playwright call happens off the single worker thread) so this
+        # thread can poll mgr.batch_progress() and update the spinner text
+        # as agents finish, instead of showing a static agent list for
+        # however long the single slowest agent takes.
+        _outcome: dict = {}
+        def _run_batch():
             try:
-                batch = mgr.send_batch(payloads)
+                _outcome["batch"] = mgr.send_batch(payloads)
             except Exception as e:
-                _log.error(f"[sid={sid}, round={round_id}] Batch transport error — {e}", exc_info=True)
-                st.error(f"⚠️ System Failure Notice: Batch transport error — {e}")
-                batch = {}
+                _outcome["error"] = e
+        _t = threading.Thread(target=_run_batch, daemon=True)
+        _t.start()
+
+        status_box = st.empty()
+        while _t.is_alive():
+            prog    = mgr.batch_progress()
+            waiting = [n for n in agent_names if not prog.get(n)]
+            done    = [n for n in agent_names if prog.get(n)]
+            if waiting:
+                text = f"⏳ Waiting for {', '.join(waiting)}…"
+                if done:
+                    text += f"  ✅ done: {', '.join(done)}"
+            else:
+                text = "⏳ Finishing up…"
+            status_box.markdown(text)
+            _t.join(timeout=0.4)
+        status_box.empty()
+
+        if "error" in _outcome:
+            e = _outcome["error"]
+            _log.error(f"[sid={sid}, round={round_id}] Batch transport error — {e}", exc_info=True)
+            st.error(f"⚠️ System Failure Notice: Batch transport error — {e}")
+            batch = {}
+        else:
+            batch = _outcome.get("batch", {})
 
         transport_stats = {"confirmed": 0, "semantic_unconfirmed": 0,
                            "quarantined": 0, "transport_failure": 0}
