@@ -9,6 +9,7 @@ Setup (one time):
 
 No separate browser windows. No profiles. No anti-bot fights.
 """
+import os
 import queue
 import threading
 import time
@@ -16,6 +17,12 @@ from pathlib import Path
 from typing import Optional
 
 CDP_URL = "http://localhost:9222"
+
+# Happy-path debug screenshots are a full-page CDP capture (~300-700ms each) and
+# fire 3x per send -- the single biggest avoidable latency on the push path. Off
+# by default; set RELAY_DEBUG=1 to capture them. Failure screenshots ignore this
+# flag (they pass always=True) so a broken send is always documented.
+DEBUG_ENABLED = os.environ.get("RELAY_DEBUG", "").strip().lower() not in ("", "0", "false", "no")
 
 SITES: dict[str, dict] = {
     "claude": {
@@ -376,7 +383,7 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
                 break
 
     if not submitted:
-        _save_debug(page, agent, "04_send_not_verified")
+        _save_debug(page, agent, "04_send_not_verified", always=True)
         raise RuntimeError(
             "Message pasted but send did not trigger — composer never cleared "
             "and no new response/stop indicator appeared after all submit attempts."
@@ -392,14 +399,20 @@ def _page_text(page) -> str:
 
 DEBUG_DIR = Path(__file__).parent / "debug"
 
-def _save_debug(page, agent: str, tag: str) -> None:
+def _save_debug(page, agent: str, tag: str, always: bool = False) -> None:
     """Screenshot + a note on what actually happened, on disk for inspection.
 
     After this many rounds of guessing at selectors blind, the faster path
     is to look at exactly what Relay saw at the moment something went wrong
     instead of proposing another speculative selector tweak.
+
+    Happy-path captures are gated behind RELAY_DEBUG (a full-page screenshot
+    costs ~300-700ms and fired 3x per send on the success path). Failure-path
+    captures pass always=True so they are written regardless of the flag.
     """
     if not agent:
+        return
+    if not (always or DEBUG_ENABLED):
         return
     try:
         DEBUG_DIR.mkdir(parents=True, exist_ok=True)
@@ -479,7 +492,7 @@ def _wait_and_read(page, site: dict, timeout: int, pre_len: int = 0,
                     break
                 time.sleep(0.5)
             if not new_el_seen:
-                _save_debug(page, agent, "03_no_new_element_appeared")
+                _save_debug(page, agent, "03_no_new_element_appeared", always=True)
 
         # Now check page-text stability (skips the thinking-pause window above).
         # The +80 floor only matters BEFORE new_el_seen, to rule out the user's
@@ -497,7 +510,10 @@ def _wait_and_read(page, site: dict, timeout: int, pre_len: int = 0,
             cur_len = len(_page_text(page))
             if cur_len == prev_len and cur_len > floor:
                 stable += 1
-                if stable >= 3:
+                # 2 flat reads (was 3): the element-count gate above already
+                # proved a real response exists, so the stability check only
+                # needs to confirm growth has stopped, not survive a long tail.
+                if stable >= 2:
                     break
             else:
                 stable = 0
@@ -518,7 +534,7 @@ def _wait_and_read(page, site: dict, timeout: int, pre_len: int = 0,
         if new_text:
             return _clean_diff(new_text)
 
-    _save_debug(page, agent, "04_no_response_captured")
+    _save_debug(page, agent, "04_no_response_captured", always=True)
     return "[No response captured — check the browser window]"
 
 
@@ -877,7 +893,11 @@ class BrowserManager:
             res_q.put(("error", f"Unknown site for agent '{agent}'"))
             return
         msg, timeout = payload
-        page.bring_to_front()
+        # No bring_to_front(): CDP dispatches input events to a page's renderer
+        # regardless of which tab is visually frontmost, so forcing a real
+        # window-focus change (with its repaint cost) bought nothing here and is
+        # the visible "switching tabs is slow" jank. The batch path already
+        # dropped it for the same reason.
         pre_len = len(_page_text(page))           # snapshot before typing
         pre_counts = _response_counts(page, site)  # element counts before typing
         _type_and_submit(page, site, msg, agent)
@@ -900,7 +920,7 @@ class BrowserManager:
             site = site_for_agent(ag)
             if page is None or page.is_closed() or site is None:
                 state[ag] = {"error": "No tab assigned or unknown site"}
-                _save_debug(page, ag, "batch_02_no_tab") if page else None
+                _save_debug(page, ag, "batch_02_no_tab", always=True) if page else None
                 continue
             # Fail-closed identity check before typing: a stale/duplicated
             # binding must not land this agent's prompt in another's tab.
@@ -926,11 +946,11 @@ class BrowserManager:
                     "start": time.time(),
                     "deadline": time.time() + tout,
                     "stable": 0, "stop_seen": False, "new_el_seen": False,
-                    "el_check_at": time.time() + 3,  # first element check after 3s
+                    "el_check_at": time.time() + 1,  # first element check after 1s
                 }
             except Exception as e:
                 state[ag] = {"error": str(e)}
-                _save_debug(page, ag, "batch_02_type_error")
+                _save_debug(page, ag, "batch_02_type_error", always=True)
 
         results = {a: f"[Error: {s['error']}]" for a, s in state.items() if "error" in s}
         pending  = [a for a in state if "error" not in state[a]]
@@ -952,7 +972,7 @@ class BrowserManager:
                         diff = cur[s["pre_len"]:].strip()
                         resp = _clean_diff(diff) if diff else ""
                     results[ag] = resp or "[Timed out]"
-                    _save_debug(page, ag, "batch_05_timeout")
+                    _save_debug(page, ag, "batch_05_timeout", always=True)
                     continue
 
                 # ── Stop-button (cheapest: single locator count call)
@@ -993,7 +1013,7 @@ class BrowserManager:
                             # timeout despite having finished immediately.
                             s["stable_floor"] = len(_page_text(page)) - 8
                         else:
-                            s["el_check_at"] = now + 3
+                            s["el_check_at"] = now + 1
                     still.append(ag)
                     s["prev_len"] = len(_page_text(page))
                     continue
@@ -1002,7 +1022,11 @@ class BrowserManager:
                 cur_len = len(_page_text(page))
                 if cur_len == s["prev_len"] and cur_len > s["stable_floor"]:
                     s["stable"] += 1
-                    if s["stable"] >= 4:
+                    # 2 flat reads (was 4): element-count gate already confirmed
+                    # real content; this just confirms growth stopped. The
+                    # stop-button branch above remains the primary done-signal
+                    # for sites that expose it -- this is the fallback tail.
+                    if s["stable"] >= 2:
                         resp = _read_last_response(page, site)
                         if not resp:
                             resp = _clean_diff(_page_text(page)[s["pre_len"]:].strip())
@@ -1010,7 +1034,7 @@ class BrowserManager:
                             results[ag] = resp
                         else:
                             results[ag] = "[No response captured]"
-                            _save_debug(page, ag, "batch_04_no_response")
+                            _save_debug(page, ag, "batch_04_no_response", always=True)
                         continue
                 else:
                     s["stable"] = 0
