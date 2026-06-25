@@ -44,10 +44,14 @@ accordingly. They were never meant to be mixed within one session.
 ## The Streamlit app's round loop, concretely
 
 1. `run_round(sid, participants, user_msg)` is the unit of work — one human
-   message in, one reply from every active agent out. `run_auto_rounds()`
-   just calls it repeatedly (N times, or unlimited until Stop) with an
-   auto-generated "continue the discussion" prompt for rounds after the
-   first.
+   message in, one reply from every active agent out. Sending a message
+   with Max Rounds > 1 (or Unlimited checked) runs round 1 normally, then
+   arms a small state machine (`_start_auto_loop`/`_advance_auto_loop`) that
+   calls `run_round` again with an auto-generated "continue the discussion"
+   prompt on each subsequent script rerun, N times or until Stop. Two
+   buttons reuse `run_round` directly for one-off special rounds instead of
+   continuing the discussion: 🎯 Final Synthesis and 📋 Assign Tasks (asks
+   each agent to propose the next concrete sub-task and who should own it).
 2. For each browser agent, `_build_browser_msg()` decides what to send: the
    full system prompt on an agent's first-ever reply, or just the other
    agents' latest replies (`_build_cross_context()`) plus the new message on
@@ -131,11 +135,16 @@ stats in the conversation, and as `capture_method` in 🔍 Debug/Recovery):
   *present and wrong* is treated as a hard mismatch. It also can't survive
   a site's own JS overwriting `window.name` for its own purposes, though no
   such case has been observed on the currently supported sites.
-- The "Stop After Round" control checks a flag between loop iterations
-  within one continuous Python call. Whether a click mid-run is guaranteed
-  to land cleanly between rounds (rather than mid-round) depends on
-  Streamlit's script-interruption behavior, which hasn't been proven safe —
-  see the docstring on `run_auto_rounds` in `app.py`.
+- ~~The "Stop After Round" control checks a flag between loop iterations
+  within one continuous Python call...~~ — fixed. The auto-loop is now a
+  session-state-driven state machine (`_advance_auto_loop` in `app.py`):
+  every round is its own complete Streamlit script execution with a real
+  `st.rerun()` boundary before the next one starts. Stop is a normal button
+  click processed *between* executions, not a flag checked inside one
+  long-running Python loop — there's nothing left running for a click to
+  interrupt mid-round. The control panel (agent selection, round count,
+  toggles) stays fully interactive while a loop is in progress, since each
+  round's script run renders it fresh before deciding whether to continue.
 - The page-text-diff fallback path (used only when an AI site's CSS
   selectors are stale) can occasionally return truncated text that isn't
   one of the known failure sentinels — a known, accepted gap, not silently

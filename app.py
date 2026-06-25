@@ -1144,6 +1144,19 @@ _FINAL_SYNTHESIS_PROMPT = (
     "Be direct and specific. This round produces the handoff brief."
 )
 
+_TASK_ASSIGNMENT_PROMPT = (
+    "Task assignment round. Discussion happens first, assignment second --"
+    " this round is the second part, not more discussion.\n\n"
+    "1. State the single most valuable next sub-task that should happen now, "
+    "based on everything discussed so far.\n"
+    "2. Propose which panelist (by name) should own it, based on the role "
+    "and strengths they've actually shown in this discussion -- it does not "
+    "have to be you.\n"
+    "3. If no one is clearly better suited, state one concrete thing you "
+    "personally will do next.\n\n"
+    "Be concrete and specific -- name a real deliverable, not a vague direction."
+)
+
 
 def _set_agent_statuses(updates: dict) -> None:
     """Write agent status tiles to session state. Called synchronously in run_round."""
@@ -1151,41 +1164,76 @@ def _set_agent_statuses(updates: dict) -> None:
         st.session_state.agent_statuses = {}
     st.session_state.agent_statuses.update(updates)
 
-def run_auto_rounds(sid: str, participants: dict, user_msg: str,
-                     n_rounds: int | None, synthesize: bool = True) -> None:
-    """Run the human's message, then further rounds automatically.
+# ── Auto-loop state machine ─────────────────────────────────────────────────
+#
+# Replaces the previous design (a single Python while-loop, inside one
+# continuous run_auto_rounds() call, checking a flag between iterations).
+# That design's safety depended on an unproven assumption about Streamlit's
+# script-interruption behavior: a Stop click during a long-running script
+# might tear down execution wherever it happened to be (mid round), not
+# cleanly between rounds. This design has no such assumption to make --
+# every round is its own complete Streamlit script execution with a real
+# st.rerun() boundary between it and the next one. Stop is a normal button
+# click processed BETWEEN executions, the same as any other widget
+# interaction; there's nothing left running for it to interrupt.
 
-    n_rounds=None means unlimited -- keeps going until Stop is clicked.
+def _auto_loop_key(sid: str) -> str:
+    return f"auto_loop_{sid}"
 
-    Caveat, stated honestly rather than assumed: this checks
-    st.session_state.relay_stop BETWEEN loop iterations within one
-    continuous Python call. On Streamlit 1.58 (installed version, no
-    @st.fragment / exception handling wrapping this loop), a NEW widget
-    interaction during a running script triggers Streamlit's own
-    interruption of that script wherever it currently is -- this is not
-    guaranteed to land cleanly between rounds; it can land mid-round (e.g.
-    mid mgr.send_batch()). In practice the blocking native calls inside
-    run_round have no Streamlit checkpoints for Streamlit to interrupt at
-    until they return, so interruption likely does land between rounds
-    most of the time -- but that's an observation, not a guarantee. If
-    testing shows Stop actually tears state, the real fix is restructuring
-    this into a session_state-driven, one-round-per-script-rerun state
-    machine (each round its own st.rerun(), Stop becomes a normal widget
-    check before the next round starts) rather than patching this loop further.
+def _get_auto_loop(sid: str) -> dict | None:
+    return st.session_state.get(_auto_loop_key(sid))
+
+def _start_auto_loop(sid: str, n_rounds: int | None, synthesize: bool) -> None:
+    """Call AFTER round 1 has already run via a normal run_round() call.
+    Arms the state machine so _advance_auto_loop continues it on
+    subsequent reruns -- round 1 itself is not part of this state machine,
+    it's just a normal manual round that happens to be followed by one.
     """
-    st.session_state.relay_stop = False
-    _set_agent_statuses({n: "Sending" for n in participants})
-    run_round(sid, participants, user_msg, synthesize=synthesize)
-    i = 2
-    while n_rounds is None or i <= n_rounds:
-        if st.session_state.get("relay_stop"):
-            st.info("⏹ Auto-loop stopped after round completion.")
-            break
-        _set_agent_statuses({n: "Sending" for n in participants})
-        label = f"Round {i}" if n_rounds is None else f"Round {i}/{n_rounds}"
-        marker = f"🔁 {label} — auto-continuing"
-        run_round(sid, participants, _AUTO_CONTINUE_MSG, synthesize=synthesize, round_label=marker)
-        i += 1
+    st.session_state[_auto_loop_key(sid)] = {
+        "active": True, "rounds_done": 1, "n_rounds": n_rounds, "synthesize": synthesize,
+    }
+
+def _stop_auto_loop(sid: str) -> None:
+    state = _get_auto_loop(sid)
+    if state:
+        state["active"] = False
+
+def _resume_auto_loop(sid: str) -> None:
+    state = _get_auto_loop(sid)
+    if state:
+        state["active"] = True
+
+def _auto_loop_is_stopped(sid: str) -> bool:
+    state = _get_auto_loop(sid)
+    return bool(state) and not state.get("active", True)
+
+def _advance_auto_loop(sid: str, participants: dict) -> None:
+    """Run exactly one more round of an active auto-loop, then rerun.
+
+    Call once per script execution, after the control panel (so Stop/Resume
+    clicks from THIS render are already applied) and before the chat input.
+    A no-op if there's no active loop -- the rest of the script proceeds
+    normally to render the chat input in that case.
+    """
+    state = _get_auto_loop(sid)
+    if not state or not state.get("active"):
+        return
+    n_rounds    = state.get("n_rounds")
+    rounds_done = state.get("rounds_done", 1)
+    if n_rounds is not None and rounds_done >= n_rounds:
+        st.session_state.pop(_auto_loop_key(sid), None)
+        return
+
+    next_round = rounds_done + 1
+    label  = f"Round {next_round}" if n_rounds is None else f"Round {next_round}/{n_rounds}"
+    marker = f"🔁 {label} — auto-continuing"
+    run_round(sid, participants, _AUTO_CONTINUE_MSG,
+             synthesize=state.get("synthesize", True), round_label=marker)
+
+    state["rounds_done"] = next_round
+    if n_rounds is not None and next_round >= n_rounds:
+        st.session_state.pop(_auto_loop_key(sid), None)
+    st.rerun()
 
 
 def retry_failed_agents(sid: str, participants: dict) -> int:
@@ -1276,7 +1324,6 @@ def retry_failed_agents(sid: str, participants: dict) -> int:
 
 if "active_session"  not in st.session_state: st.session_state.active_session  = None
 if "edit_agent"      not in st.session_state: st.session_state.edit_agent      = None
-if "relay_stop"      not in st.session_state: st.session_state.relay_stop      = False
 if "agent_statuses"  not in st.session_state: st.session_state.agent_statuses  = {}
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1445,13 +1492,13 @@ if mode == "Conversations":
                 with cp3:
                     st.metric("Round", meta.get("round_count", 0))
 
-                ctrl1, ctrl2, ctrl3, ctrl4, ctrl5 = st.columns(5)
+                ctrl1, ctrl2, ctrl3, ctrl4, ctrl5, ctrl6 = st.columns(6)
                 with ctrl1:
                     synthesize = st.toggle("🔮 Synthesize", value=True, key=_k_synth)
                 with ctrl2:
                     stop_btn = st.button("⏹ Stop After Round", use_container_width=True)
                     if stop_btn:
-                        st.session_state.relay_stop = True
+                        _stop_auto_loop(sid)
                         st.rerun()
                 with ctrl3:
                     final_synth_btn = st.button("🎯 Final Synthesis", use_container_width=True,
@@ -1461,8 +1508,45 @@ if mode == "Conversations":
                     retry_btn = st.button("🔄 Retry Failed", use_container_width=True,
                                           help="Re-send last round's prompt to failed agents only.")
                 with ctrl5:
-                    stop_status = "🔴 Stop queued" if st.session_state.get("relay_stop") else "🟢 Running"
-                    st.caption(stop_status)
+                    assign_tasks_btn = st.button("📋 Assign Tasks", use_container_width=True,
+                                                 help="Ask each agent to propose the next concrete sub-task "
+                                                      "and who (by name) should own it.")
+                with ctrl6:
+                    preflight_btn = st.button("🛫 Preflight", use_container_width=True,
+                                              help="Check tab identity, URL, input visibility, and semantic "
+                                                   "count for every selected agent — no prompt sent.")
+
+                _loop = _get_auto_loop(sid)
+                if _loop is None:
+                    stop_status = "⚪ No auto-loop"
+                elif _loop.get("active"):
+                    rd, nr = _loop.get("rounds_done", 1), _loop.get("n_rounds")
+                    stop_status = f"🟢 Running (round {rd}" + (f"/{nr})" if nr else ", unlimited)")
+                else:
+                    stop_status = "🔴 Stopped"
+                st.caption(stop_status)
+
+            # ── Preflight check ───────────────────────────────────────────────
+            if preflight_btn and mgr and round_participants:
+                browser_participants = {n: c for n, c in round_participants.items()
+                                        if getattr(c, "mode", "api") == "browser"}
+                results = {n: mgr.fast_health_check(n) for n in browser_participants}
+                st.session_state[f"preflight_{sid}"] = results
+
+            preflight_results = st.session_state.get(f"preflight_{sid}")
+            if preflight_results:
+                with st.expander("🛫 Preflight results", expanded=True):
+                    for name, r in preflight_results.items():
+                        ok = r.get("ok")
+                        icon = "🟢" if ok else "🔴"
+                        marker = r.get("marker") or "(unmarked)"
+                        sc = r.get("semantic_count")
+                        sc_str = str(sc) if sc is not None else "?"
+                        st.caption(
+                            f"{icon} **{name.upper()}** — url: `{r.get('url', '?')}` · "
+                            f"marker: `{marker}` · semantic_count: {sc_str}"
+                            + (f" · ⚠ {r.get('reason')}" if not ok else "")
+                        )
 
             # ── Agent Status Grid ─────────────────────────────────────────────
             statuses = st.session_state.get("agent_statuses", {})
@@ -1569,25 +1653,43 @@ if mode == "Conversations":
                               synthesize=True, round_label="🎯 Final Synthesis")
                 st.rerun()
 
+            # ── Task Assignment trigger ───────────────────────────────────────
+            # Discuss first, assign second: a deliberate, separate round rather
+            # than folding "who does what" into every auto-continue prompt, so
+            # the panel actually discusses before jumping to assignment.
+            if assign_tasks_btn and round_participants:
+                with st.spinner("Running task-assignment round…"):
+                    run_round(sid, round_participants, _TASK_ASSIGNMENT_PROMPT,
+                              synthesize=True, round_label="📋 Task Assignment")
+                st.rerun()
+
             # ── Stop / resume button (inline near message area) ──────────────
-            _stopped = st.session_state.get("relay_stop", False)
+            _stopped = _auto_loop_is_stopped(sid)
             _sb_col1, _sb_col2 = st.columns([10, 1])
             with _sb_col2:
                 if _stopped:
                     if st.button("▶", key="resume_inline",
-                                 help="Resume auto-loop on next message",
+                                 help="Resume the auto-loop from where it stopped",
                                  use_container_width=True):
-                        st.session_state.relay_stop = False
+                        _resume_auto_loop(sid)
                         st.rerun()
-                else:
+                elif _get_auto_loop(sid):
                     if st.button("⏹", key="stop_inline",
-                                 help="Stop auto-loop after this round finishes",
+                                 help="Stop the auto-loop after the round in flight finishes",
                                  use_container_width=True):
-                        st.session_state.relay_stop = True
+                        _stop_auto_loop(sid)
                         st.rerun()
             with _sb_col1:
                 if _stopped:
-                    st.caption("⏹ Loop stopped — type a message to start a new round")
+                    st.caption("⏹ Loop stopped — click ▶ to resume, or type a message to start a new round")
+
+            # ── Advance the auto-loop, if one is active ───────────────────────
+            # Must run after the control panel (so a Stop/Resume click from
+            # THIS render is already applied) and before the chat input.
+            # Each call here runs exactly one round then reruns -- a no-op
+            # when no loop is active, falling through to render chat input
+            # normally.
+            _advance_auto_loop(sid, round_participants)
 
             # ── Chat input ────────────────────────────────────────────────────
             if user_input := st.chat_input("Message all agents…"):
@@ -1603,16 +1705,16 @@ if mode == "Conversations":
                     if file_attachment:
                         st.caption(f"📎 {fname}")
                     st.markdown(user_input)
-                # Sending a new message clears any pending stop so the new
-                # round runs the requested number of times.
-                st.session_state.relay_stop = False
+                # A new message replaces any previous loop state outright --
+                # round 1 always runs as a normal manual round; _start_auto_loop
+                # arms the state machine to continue it on subsequent reruns
+                # only if more rounds were actually requested.
+                st.session_state.pop(_auto_loop_key(sid), None)
+                run_round(sid, round_participants, full_msg, synthesize=synthesize)
                 if unlimited:
-                    run_auto_rounds(sid, round_participants, full_msg, None, synthesize=synthesize)
+                    _start_auto_loop(sid, None, synthesize)
                 elif auto_rounds > 1:
-                    run_auto_rounds(sid, round_participants, full_msg,
-                                    int(auto_rounds), synthesize=synthesize)
-                else:
-                    run_round(sid, round_participants, full_msg, synthesize=synthesize)
+                    _start_auto_loop(sid, int(auto_rounds), synthesize)
                 st.rerun()
 
     else:
@@ -1719,6 +1821,7 @@ elif mode == "Agents":
                                     _set_agent_statuses({name: "Checking"})
                                     try:
                                         result = mgr.fast_health_check(name)
+                                        st.session_state[f"hc_result_{name}"] = result
                                         if result.get("ok"):
                                             _set_agent_statuses({name: "Healthy"})
                                             st.session_state.pop(f"hc_err_{name}", None)
@@ -1733,6 +1836,23 @@ elif mode == "Agents":
                             hc_err = st.session_state.pop(f"hc_err_{name}", None)
                             if hc_err:
                                 st.error(hc_err)
+                            # Persistent marker status from the last "⚡ Check" run --
+                            # not re-checked on every render (Playwright round-trip
+                            # per agent on every rerun was exactly the latency
+                            # mistake active_agents()/list_agents() already fixed
+                            # elsewhere; this only updates when the operator clicks).
+                            last_check = st.session_state.get(f"hc_result_{name}")
+                            if last_check:
+                                marker = last_check.get("marker", "")
+                                if last_check.get("marker_ok") is False:
+                                    st.caption(f"🏷 Marker mismatch — tab marked '{marker}'")
+                                elif marker:
+                                    st.caption(f"🏷 Marker: {marker} ✓")
+                                else:
+                                    st.caption("🏷 Marker: unmarked (pre-existing tab, treated as OK)")
+                                sc = last_check.get("semantic_count")
+                                if sc is not None:
+                                    st.caption(f"📡 Semantic count: {sc}")
                             if st.button("🔬 Full Check", key=f"fullhc_{name}", use_container_width=True,
                                          help="Sends 'health-ok' probe and verifies capture — slow"):
                                 _set_agent_statuses({name: "Checking"})

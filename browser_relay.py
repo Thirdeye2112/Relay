@@ -1095,15 +1095,31 @@ class BrowserManager:
             res_q.put(("error", str(e)))
 
     def _do_fast_health(self, agent: str, res_q):
-        """Check tab existence, URL, input visibility — no prompt sent."""
+        """Check tab existence, URL, input visibility, identity marker,
+        semantic count — no prompt sent. Doubles as the per-agent transport
+        preflight check: marker/semantic_count are reported regardless of
+        whether the basic checks pass, so a preflight panel can show the
+        full diagnostic picture even for an agent that's already failing.
+        """
         page = self._pages.get(agent)
         site = site_for_agent(agent)
-        result: dict = {"agent": agent, "ok": False, "reason": None}
+        result: dict = {"agent": agent, "ok": False, "reason": None,
+                        "marker": "", "marker_ok": None, "semantic_count": None}
 
         if page is None or page.is_closed():
             result["reason"] = "No tab assigned or tab was closed"
             res_q.put(("ok", result))
             return
+
+        marker = _read_page_agent_marker(page)
+        result["marker"]    = marker
+        result["marker_ok"] = (not marker) or (marker == agent)  # unmarked = OK, present-and-wrong = not
+
+        if site is not None:
+            try:
+                result["semantic_count"] = sum(_semantic_counts(page, site).values())
+            except Exception:
+                pass
 
         url_match = (site or {}).get("url_match", "")
         if url_match and url_match not in page.url:
@@ -1124,6 +1140,11 @@ class BrowserManager:
                 return
         except Exception as exc:
             result["reason"] = f"Input check error: {exc}"
+            res_q.put(("ok", result))
+            return
+
+        if not result["marker_ok"]:
+            result["reason"] = f"Tab identity mismatch — expected '{agent}', tab marked '{marker}'"
             res_q.put(("ok", result))
             return
 
