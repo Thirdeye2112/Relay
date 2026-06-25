@@ -44,12 +44,32 @@ API-only CLI with its own canonical-transcript engine — see README.md's
 
 ## Architecture decisions
 
-- **One dedicated Playwright worker thread** (`BrowserManager._run`)
-  processes a command queue. Playwright's sync API is not thread-safe
-  across a single CDP connection — this is why everything is serialized
-  on one thread, sequentially, even in `send_batch`. Do not "fix" this
-  with a thread pool; it would break the one CDP connection model, not
-  speed it up.
+- **One dedicated Playwright worker thread, one asyncio event loop, one
+  CDP connection.** `BrowserManager._run` spins up the worker OS thread
+  exactly as before, but it now runs `asyncio.run(self._run_async())`:
+  one event loop hosting one `playwright.async_api` connection, dequeuing
+  commands from the same `queue.Queue` via
+  `loop.run_in_executor(None, self._cmd_q.get, True, 0.3)` (only the
+  blocking queue-get is offloaded — no Playwright call ever runs off this
+  loop). All Playwright-touching helpers are `async def`/`await`; the
+  public `BrowserManager` API (`send_message`, `send_batch`, `scan_tabs`,
+  etc.) is still plain synchronous code called from the caller's
+  (Streamlit) thread via `_call`, which blocks on `res_q.get(timeout=...)`
+  — callers needed zero changes. `_do_send_batch`'s response-wait step
+  replaced the old shared `time.sleep(0.75)` round-robin poll with
+  independent per-agent `_poll_one(ag)` coroutines reaped via
+  `asyncio.as_completed`, each on its own ~0.15s cadence, so one slow
+  agent's wait no longer gates how soon a faster agent's reply is read.
+  This is concurrency *within* the single event loop, not parallelism —
+  there is still exactly one CDP connection and one thread. Do not "fix"
+  this with a thread pool; it would break the one-connection model, not
+  speed it up. **Not verified against a live Chrome/CDP session** (no
+  Chrome available in the sandbox that wrote this) — `python3
+  test_relay.py` passes (32/32, covers only the pure/non-Playwright
+  logic), but the real multi-agent `send_batch` concurrency path,
+  `_arm_auto_resume`'s CDP `Debugger.paused` auto-resume handler, and
+  every selector/timing-sensitive helper need confirming against a real
+  tab before trusting this in production.
 - **`site_key` override beats name inference, always.** `site_for_agent`
   infers a site from an agent's name only when no explicit `site_key` is
   set, and that inference always maps any "claude"-containing name to

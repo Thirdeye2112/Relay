@@ -9,6 +9,7 @@ Setup (one time):
 
 No separate browser windows. No profiles. No anti-bot fights.
 """
+import asyncio
 import queue
 import threading
 import time
@@ -273,10 +274,15 @@ def classify_tab_url(url: str) -> str:
 
 
 # ── Page helpers ────────────────────────────────────────────────────────────────
+# Everything below talks to a page via playwright.async_api. All these helpers
+# run on BrowserManager's single dedicated event loop (one OS thread, one CDP
+# connection) -- async/await gives concurrency WITHIN that one loop (e.g. for
+# the multi-agent wait phase in _do_send_batch) without ever opening a second
+# connection or a thread pool. Do not call these from any other thread/loop.
 
 _AGENT_MARKER_PREFIX = "RELAY_AGENT:"
 
-def _mark_page_for_agent(page, agent: str) -> None:
+async def _mark_page_for_agent(page, agent: str) -> None:
     """Stamp window.name so this tab's identity can be verified later.
 
     Multiple same-provider personas (e.g. CLAUDE_OPTIMIST, CLAUDE_SKEPTIC,
@@ -288,15 +294,15 @@ def _mark_page_for_agent(page, agent: str) -> None:
     confusing downstream symptom like a stale-DOM-read quarantine.
     """
     try:
-        page.evaluate("name => { window.name = name; }", f"{_AGENT_MARKER_PREFIX}{agent}")
+        await page.evaluate("name => { window.name = name; }", f"{_AGENT_MARKER_PREFIX}{agent}")
     except Exception:
         pass  # marking is a safeguard, not a hard requirement -- never block assignment on it
 
 
-def _read_page_agent_marker(page) -> str:
+async def _read_page_agent_marker(page) -> str:
     """Return the agent name a tab is marked for, or '' if unmarked/unreadable."""
     try:
-        name = page.evaluate("() => window.name || ''")
+        name = await page.evaluate("() => window.name || ''")
     except Exception:
         return ""
     if name.startswith(_AGENT_MARKER_PREFIX):
@@ -304,7 +310,7 @@ def _read_page_agent_marker(page) -> str:
     return ""
 
 
-def _verify_tab_identity(page, agent: str) -> tuple[bool, str]:
+async def _verify_tab_identity(page, agent: str) -> tuple[bool, str]:
     """Check the tab's marker matches the agent we're about to send to.
 
     Returns (ok, marker). An empty marker (tab assigned before this feature
@@ -312,13 +318,13 @@ def _verify_tab_identity(page, agent: str) -> tuple[bool, str]:
     safeguard against drift, not a hard gate that breaks existing sessions.
     Only a marker that's PRESENT and WRONG is a hard mismatch.
     """
-    marker = _read_page_agent_marker(page)
+    marker = await _read_page_agent_marker(page)
     if not marker:
         return True, marker
     return marker == agent, marker
 
 
-def _resolve_selector(page, selectors, timeout: int = 1500, prefer_latest: bool = True):
+async def _resolve_selector(page, selectors, timeout: int = 1500, prefer_latest: bool = True):
     """Resolve to a single, VISIBLE matching element.
 
     Hidden/decoy duplicates (legacy SEO textareas, off-screen mobile
@@ -338,14 +344,14 @@ def _resolve_selector(page, selectors, timeout: int = 1500, prefer_latest: bool 
         selectors = [selectors]
     for sel in selectors:
         try:
-            page.wait_for_selector(sel, timeout=timeout)
+            await page.wait_for_selector(sel, timeout=timeout)
             loc = page.locator(sel)
-            n = loc.count()
+            n = await loc.count()
             ordering = range(n - 1, -1, -1) if prefer_latest else range(n)
             for i in ordering:
                 candidate = loc.nth(i)
                 try:
-                    if candidate.is_visible():
+                    if await candidate.is_visible():
                         return candidate
                 except Exception:
                     continue
@@ -354,7 +360,7 @@ def _resolve_selector(page, selectors, timeout: int = 1500, prefer_latest: bool 
     return None
 
 
-def _force_input_events(page) -> None:
+async def _force_input_events(page) -> None:
     """Dispatch a real InputEvent + change on the focused element.
 
     Clipboard paste populates the visible DOM but framework-controlled
@@ -367,7 +373,7 @@ def _force_input_events(page) -> None:
     never sent."
     """
     try:
-        page.evaluate("""() => {
+        await page.evaluate("""() => {
             const el = document.activeElement;
             if (!el) return;
             el.dispatchEvent(new InputEvent('input', {
@@ -380,7 +386,7 @@ def _force_input_events(page) -> None:
         pass
 
 
-def _insert_text_direct(page, el, message: str) -> bool:
+async def _insert_text_direct(page, el, message: str) -> bool:
     """Insert text via Playwright's dedicated Keyboard.insertText.
 
     Dispatches a real `input` event directly to the focused element -- no
@@ -392,15 +398,15 @@ def _insert_text_direct(page, el, message: str) -> bool:
     mode this codebase has hit outright rather than working around it.
     """
     try:
-        el.click()
-        page.keyboard.press("Control+a")  # select existing content so insert replaces it
-        page.keyboard.insert_text(message)
+        await el.click()
+        await page.keyboard.press("Control+a")  # select existing content so insert replaces it
+        await page.keyboard.insert_text(message)
         return True
     except Exception:
         return False
 
 
-def _clipboard_insert(page, message: str) -> bool:
+async def _clipboard_insert(page, message: str) -> bool:
     """Write message to OS clipboard then paste into the focused element.
 
     Fallback for the rare case _insert_text_direct doesn't register
@@ -413,22 +419,22 @@ def _clipboard_insert(page, message: str) -> bool:
     try:
         # Grant clipboard-write permission for this origin — harmless if already set.
         try:
-            page.context.grant_permissions(["clipboard-write"])
+            await page.context.grant_permissions(["clipboard-write"])
         except Exception:
             pass
-        page.evaluate("async t => { await navigator.clipboard.writeText(t); }", message)
-        time.sleep(0.1)   # let the async write settle
-        page.keyboard.press("Control+a")
-        time.sleep(0.05)  # let selection register before paste
-        page.keyboard.press("Control+v")
-        time.sleep(0.1)   # let the paste land in the DOM before nudging the framework
-        _force_input_events(page)
+        await page.evaluate("async t => { await navigator.clipboard.writeText(t); }", message)
+        await asyncio.sleep(0.1)   # let the async write settle
+        await page.keyboard.press("Control+a")
+        await asyncio.sleep(0.05)  # let selection register before paste
+        await page.keyboard.press("Control+v")
+        await asyncio.sleep(0.1)   # let the paste land in the DOM before nudging the framework
+        await _force_input_events(page)
         return True
     except Exception:
         return False
 
 
-def _did_clear(el, page=None) -> bool:
+async def _did_clear(el, page=None) -> bool:
     """True if the composer is now empty -- the universal "it actually sent" signal.
 
     Falls back to document.activeElement when el is stale (ProseMirror rebuilds
@@ -436,7 +442,8 @@ def _did_clear(el, page=None) -> bool:
     captured before the paste).
     """
     try:
-        return not (el.evaluate("e => (e.innerText || e.value || '').trim()"))
+        text = await el.evaluate("e => (e.innerText || e.value || '').trim()")
+        return not text
     except Exception:
         if page:
             try:
@@ -444,7 +451,7 @@ def _did_clear(el, page=None) -> bool:
                 # element.  document.body / buttons / the full page would have
                 # non-empty innerText and make this always return False even
                 # after a successful send.
-                return page.evaluate("""() => {
+                return await page.evaluate("""() => {
                     const e = document.activeElement;
                     if (!e) return false;
                     const isComposer = e.contentEditable === 'true'
@@ -459,8 +466,8 @@ def _did_clear(el, page=None) -> bool:
         return False
 
 
-def _verify_sent(page, site: dict, el, pre_counts: dict, timeout: float = 4.0,
-                 pre_url: str = "") -> bool:
+async def _verify_sent(page, site: dict, el, pre_counts: dict, timeout: float = 4.0,
+                       pre_url: str = "") -> bool:
     """Fast post-submit check: did the composer clear, a stop button appear,
     a URL navigation happen, or a new response element show up?
 
@@ -476,26 +483,26 @@ def _verify_sent(page, site: dict, el, pre_counts: dict, timeout: float = 4.0,
         # Navigation = form submitted (e.g. Perplexity navigates after send)
         if pre_url and page.url != pre_url:
             return True
-        if _did_clear(el, page):
+        if await _did_clear(el, page):
             return True
         if stop_sels:
             for ss in stop_sels:
                 try:
-                    if page.locator(ss).count() > 0:
+                    if await page.locator(ss).count() > 0:
                         return True
                 except Exception:
                     pass
         try:
-            cur_counts = _response_counts(page, site)
+            cur_counts = await _response_counts(page, site)
             if any(cur_counts.get(sel, 0) > n for sel, n in pre_counts.items()):
                 return True
         except Exception:
             pass
-        time.sleep(0.2)
+        await asyncio.sleep(0.2)
     return False
 
 
-def _verify_prompt_inserted(el, message: str) -> tuple[bool, str]:
+async def _verify_prompt_inserted(el, message: str) -> tuple[bool, str]:
     """Check the composer actually contains (a meaningful chunk of) the
     intended message before proceeding to click send.
 
@@ -512,7 +519,7 @@ def _verify_prompt_inserted(el, message: str) -> tuple[bool, str]:
     insertions. Whitespace is collapsed on both sides before comparing.
     """
     try:
-        actual = (el.evaluate("e => (e.innerText || e.value || '').trim()") or "")
+        actual = (await el.evaluate("e => (e.innerText || e.value || '').trim()") or "")
     except Exception as exc:
         return False, f"composer read failed: {exc}"
 
@@ -532,7 +539,7 @@ def _verify_prompt_inserted(el, message: str) -> tuple[bool, str]:
     return False, actual
 
 
-def _attach_file(page, site: dict, file_path: str, agent: str = "") -> bool:
+async def _attach_file(page, site: dict, file_path: str, agent: str = "") -> bool:
     """Best-effort attach of a local file via the composer's file input.
 
     site["file_input"] selectors are generic, UNVERIFIED guesses (no live
@@ -547,81 +554,80 @@ def _attach_file(page, site: dict, file_path: str, agent: str = "") -> bool:
     for sel in sels:
         try:
             loc = page.locator(sel)
-            if loc.count() == 0:
+            if await loc.count() == 0:
                 continue
-            loc.first.set_input_files(file_path)
+            await loc.first.set_input_files(file_path)
             return True
         except Exception:
             continue
-    _save_debug(page, agent, "file_attach_failed")
+    await _save_debug(page, agent, "file_attach_failed")
     return False
 
 
-def _type_and_submit(page, site: dict, message: str, agent: str = "",
-                      fast_mode: bool = False) -> dict:
+async def _type_and_submit(page, site: dict, message: str, agent: str = "",
+                            fast_mode: bool = False) -> dict:
     """Returns {"insertion_ms": int, "send_verify_ms": int} on success.
     Still raises RuntimeError on failure (callers unchanged) -- timing is
     additive, not a new control-flow path.
-    """
-    _t0 = time.time()
-    """fast_mode tightens the submit-tier verification deadlines below for
+
+    fast_mode tightens the submit-tier verification deadlines below for
     the batch-send context specifically: _do_send_batch's Step 1 submits to
-    every agent SEQUENTIALLY on this one thread (deliberately -- Playwright's
-    sync API isn't thread-safe across one CDP connection, so this can't be
-    parallelized), which means one agent stuck cycling through all three
-    submit tiers at single-send patience (~20s worst case) fully blocks every
-    later agent in that loop from even starting to type, let alone respond.
+    every agent SEQUENTIALLY (deliberately -- everything here runs on
+    BrowserManager's single event loop/single CDP connection, so a stuck
+    agent waiting on Tier 1/2/3 deadlines could otherwise block every later
+    agent in that loop from even starting to type, let alone respond).
     Single-send (_do_send, health checks) keeps the patient defaults since
     nothing else is waiting on it there.
     """
-    el = _resolve_selector(page, site["input"])
+    _t0 = time.time()
+    el = await _resolve_selector(page, site["input"])
     if el is None:
         raise RuntimeError(
             f"Input box not found on {page.url} (no VISIBLE match in {site['input']}). "
             "Is the page fully loaded and are you logged in?"
         )
-    _save_debug(page, agent, "01_before_type")
-    el.click()
-    time.sleep(0.1)   # let focus settle before detecting element type
-    tag = el.evaluate("el => el.tagName.toLowerCase()")
+    await _save_debug(page, agent, "01_before_type")
+    await el.click()
+    await asyncio.sleep(0.1)   # let focus settle before detecting element type
+    tag = await el.evaluate("el => el.tagName.toLowerCase()")
     # Narrowed to the actual Lexical attribute -- role="textbox" matches any
     # ARIA textbox (including plain contenteditable divs on non-Lexical
     # sites), which wrongly picked the newline-flattening fallback for them.
-    is_lexical = el.evaluate("el => el.hasAttribute('data-lexical-editor')")
+    is_lexical = await el.evaluate("el => el.hasAttribute('data-lexical-editor')")
 
     if tag in ("textarea", "input"):
         # Native fill triggers React state correctly
-        el.fill(message)
-        el.dispatch_event("input")
-        el.dispatch_event("change")
+        await el.fill(message)
+        await el.dispatch_event("input")
+        await el.dispatch_event("change")
     else:
         # For all contenteditable (Lexical, ProseMirror, etc.): try the most
         # direct path first (Playwright's own insertText), then progressively
         # less direct fallbacks. keyboard.type() fires real Enter events on
         # every \n, submitting Lexical forms mid-message -- avoided throughout.
-        if _insert_text_direct(page, el, message):
-            _force_input_events(page)  # cheap defensive nudge even though insertText already fires input
-        elif not _clipboard_insert(page, message):
+        if await _insert_text_direct(page, el, message):
+            await _force_input_events(page)  # cheap defensive nudge even though insertText already fires input
+        elif not await _clipboard_insert(page, message):
             if is_lexical:
                 # Lexical fallback: type without newlines to avoid premature submit
-                page.keyboard.press("Control+a")
-                page.keyboard.type(message.replace("\n", " "))
+                await page.keyboard.press("Control+a")
+                await page.keyboard.type(message.replace("\n", " "))
             else:
                 # ProseMirror fallback: execCommand (deprecated but may still work)
-                page.evaluate(
+                await page.evaluate(
                     "text => { document.execCommand('selectAll'); "
                     "document.execCommand('insertText', false, text); }",
                     message,
                 )
-            _force_input_events(page)
-    time.sleep(0.2)
-    _save_debug(page, agent, "02_after_paste")
+            await _force_input_events(page)
+    await asyncio.sleep(0.2)
+    await _save_debug(page, agent, "02_after_paste")
 
     # Re-resolve element after paste — ProseMirror rebuilds its DOM nodes during
     # large clipboard inserts, making the original `el` reference stale before
     # we even try to click the send button.
     try:
-        fresh = _resolve_selector(page, site["input"], timeout=800, prefer_latest=False)
+        fresh = await _resolve_selector(page, site["input"], timeout=800, prefer_latest=False)
         if fresh:
             el = fresh
     except Exception:
@@ -630,16 +636,16 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "",
     # Verify the intended text actually landed before attempting to send --
     # a no-op insertion (focus loss, clipboard race, stale node) must not be
     # allowed to proceed into the send tiers as if real text was waiting there.
-    inserted_ok, actual_text = _verify_prompt_inserted(el, message)
+    inserted_ok, actual_text = await _verify_prompt_inserted(el, message)
     if not inserted_ok:
-        _save_debug(page, agent, "02b_prompt_not_inserted")
+        await _save_debug(page, agent, "02b_prompt_not_inserted")
         raise RuntimeError(
             f"Prompt insertion verification failed — composer does not contain "
             f"the intended message (composer has: {actual_text[:120]!r})"
         )
 
     _t_insert_done = time.time()
-    pre_counts = _response_counts(page, site)
+    pre_counts = await _response_counts(page, site)
     pre_url    = page.url  # capture URL for navigation-detection in _verify_sent
     submitted  = False
 
@@ -658,19 +664,19 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "",
     if send_sel:
         try:
             btn = page.locator(send_sel)
-            btn.first.wait_for(state="visible", timeout=wait_visible_ms)
+            await btn.first.wait_for(state="visible", timeout=wait_visible_ms)
             deadline = time.time() + enable_poll_s
             while time.time() < deadline:
-                if btn.count() > 0 and btn.first.is_enabled():
-                    btn.first.click()
+                if await btn.count() > 0 and await btn.first.is_enabled():
+                    await btn.first.click()
                     submitted = True
                     break
-                time.sleep(0.15)
+                await asyncio.sleep(0.15)
         except Exception:
             pass
         if submitted:
-            _save_debug(page, agent, "03_after_send_click")
-            if not _verify_sent(page, site, el, pre_counts, timeout=verify1_s, pre_url=pre_url):
+            await _save_debug(page, agent, "03_after_send_click")
+            if not await _verify_sent(page, site, el, pre_counts, timeout=verify1_s, pre_url=pre_url):
                 submitted = False  # click was a no-op -- composer never cleared
 
     # Tier 2: JS fallback. Must filter for actual send/submit semantics and
@@ -680,7 +686,7 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "",
     # attach/mic/tools control instead, clicking it and reporting success.
     if not submitted:
         try:
-            clicked = page.evaluate("""() => {
+            clicked = await page.evaluate("""() => {
                 function isSend(b) {
                     const s = ((b.getAttribute('aria-label')||'') + ' ' +
                                (b.getAttribute('data-testid')||'') + ' ' +
@@ -713,8 +719,8 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "",
         except Exception:
             pass
         if submitted:
-            _save_debug(page, agent, "03_after_send_click")
-            if not _verify_sent(page, site, el, pre_counts, timeout=verify2_s, pre_url=pre_url):
+            await _save_debug(page, agent, "03_after_send_click")
+            if not await _verify_sent(page, site, el, pre_counts, timeout=verify2_s, pre_url=pre_url):
                 submitted = False
 
     # Tier 3: keyboard submit chords, each verified before trying the next --
@@ -725,18 +731,18 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "",
             try:
                 # Re-resolve element — may have become stale if ProseMirror
                 # rebuilt the node during Tier 1/2 attempts.
-                cur_el = _resolve_selector(page, site["input"], timeout=500,
-                                           prefer_latest=False) or el
-                cur_el.click()
-                cur_el.press(chord)
+                cur_el = await _resolve_selector(page, site["input"], timeout=500,
+                                                  prefer_latest=False) or el
+                await cur_el.click()
+                await cur_el.press(chord)
             except Exception:
                 continue
-            if _verify_sent(page, site, el, pre_counts, timeout=verify3_s, pre_url=pre_url):
+            if await _verify_sent(page, site, el, pre_counts, timeout=verify3_s, pre_url=pre_url):
                 submitted = True
                 break
 
     if not submitted:
-        _save_debug(page, agent, "04_send_not_verified")
+        await _save_debug(page, agent, "04_send_not_verified")
         raise RuntimeError(
             "Message pasted but send did not trigger — composer never cleared "
             "and no new response/stop indicator appeared after all submit attempts."
@@ -749,16 +755,16 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "",
     }
 
 
-def _page_text(page) -> str:
+async def _page_text(page) -> str:
     try:
-        return page.evaluate("() => document.body.innerText") or ""
+        return await page.evaluate("() => document.body.innerText") or ""
     except Exception:
         return ""
 
 
 DEBUG_DIR = Path(__file__).parent / "debug"
 
-def _save_debug(page, agent: str, tag: str) -> None:
+async def _save_debug(page, agent: str, tag: str) -> None:
     """Screenshot + a note on what actually happened, on disk for inspection.
 
     After this many rounds of guessing at selectors blind, the faster path
@@ -771,26 +777,26 @@ def _save_debug(page, agent: str, tag: str) -> None:
         DEBUG_DIR.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         base = DEBUG_DIR / f"{agent}_{tag}_{stamp}"
-        page.screenshot(path=str(base.with_suffix(".png")))
+        await page.screenshot(path=str(base.with_suffix(".png")))
         base.with_suffix(".url.txt").write_text(page.url, encoding="utf-8")
     except Exception:
         pass
 
 
-def _response_counts(page, site: dict) -> dict:
+async def _response_counts(page, site: dict) -> dict:
     resp_sels = site.get("response_sel", [])
     if isinstance(resp_sels, str):
         resp_sels = [resp_sels]
     counts = {}
     for sel in resp_sels:
         try:
-            counts[sel] = page.locator(sel).count()
+            counts[sel] = await page.locator(sel).count()
         except Exception:
             counts[sel] = 0
     return counts
 
 
-def _semantic_counts(page, site: dict) -> dict:
+async def _semantic_counts(page, site: dict) -> dict:
     """Count completed assistant-turn containers using semantic selectors.
 
     Semantic selectors target the top-level turn container (one per reply),
@@ -799,21 +805,21 @@ def _semantic_counts(page, site: dict) -> dict:
     """
     sels = site.get("semantic_sel", [])
     if not sels:
-        return _response_counts(page, site)
+        return await _response_counts(page, site)
     if isinstance(sels, str):
         sels = [sels]
     counts = {}
     for sel in sels:
         try:
-            counts[sel] = page.locator(sel).count()
+            counts[sel] = await page.locator(sel).count()
         except Exception:
             counts[sel] = 0
     return counts
 
 
-def _wait_and_read(page, site: dict, timeout: int, pre_len: int = 0,
-                    pre_counts: dict | None = None, agent: str = "",
-                    pre_method: str = "fallback", pre_url: str = "") -> dict:
+async def _wait_and_read(page, site: dict, timeout: int, pre_len: int = 0,
+                          pre_counts: dict | None = None, agent: str = "",
+                          pre_method: str = "fallback", pre_url: str = "") -> dict:
     """Wait for the AI response then return it wrapped in a lineage envelope.
 
     Strategy:
@@ -843,25 +849,27 @@ def _wait_and_read(page, site: dict, timeout: int, pre_len: int = 0,
     if stop_sels:
         # Poll for any stop button to appear (generation started)
         for _ in range(10):
-            if any(page.locator(ss).count() > 0 for ss in stop_sels):
+            counts = [await page.locator(ss).count() for ss in stop_sels]
+            if any(c > 0 for c in counts):
                 appeared = True
                 break
-            time.sleep(0.5)
+            await asyncio.sleep(0.5)
         if appeared:
             # Wait until no stop button is visible (generation done)
             deadline_stop = time.time() + timeout
             while time.time() < deadline_stop:
-                if not any(page.locator(ss).count() > 0 for ss in stop_sels):
+                counts = [await page.locator(ss).count() for ss in stop_sels]
+                if not any(c > 0 for c in counts):
                     break
-                time.sleep(0.5)
+                await asyncio.sleep(0.5)
             # Fast path: if the response selectors still match (the common
             # case), we're done. If they're stale (a UI redesign moved the
             # class names), don't jump straight to the unreliable raw
             # page-text diff below -- fall through into the SAME element-
             # count/stability logic used when no stop button matched at all.
-            resp = _read_last_response(page, site)
+            resp = await _read_last_response(page, site)
             if resp:
-                return _make_envelope(agent, resp, pre_counts or {}, page, site, pre_method, pre_url)
+                return await _make_envelope(agent, resp, pre_counts or {}, page, site, pre_method, pre_url)
             appeared = False
 
     if not appeared:
@@ -871,13 +879,13 @@ def _wait_and_read(page, site: dict, timeout: int, pre_len: int = 0,
         new_el_seen = False
         if pre_counts:
             while time.time() < deadline:
-                cur_counts = _semantic_counts(page, site)
+                cur_counts = await _semantic_counts(page, site)
                 if any(cur_counts.get(sel, 0) > n for sel, n in pre_counts.items()):
                     new_el_seen = True
                     break
-                time.sleep(0.5)
+                await asyncio.sleep(0.5)
             if not new_el_seen:
-                _save_debug(page, agent, "03_no_new_element_appeared")
+                await _save_debug(page, agent, "03_no_new_element_appeared")
 
         # Now check page-text stability (skips the thinking-pause window above).
         # The +80 floor only matters BEFORE new_el_seen, to rule out the user's
@@ -887,12 +895,12 @@ def _wait_and_read(page, site: dict, timeout: int, pre_len: int = 0,
         # wrong: short replies (handshake-style "Confirmed.", "[NAME] online.")
         # never reach it and always burn the full timeout despite having
         # finished immediately. Drop the floor to a tiny margin once gated.
-        time.sleep(1)
-        floor = pre_len + 80 if not new_el_seen else len(_page_text(page)) - 8
-        prev_len = len(_page_text(page))
+        await asyncio.sleep(1)
+        floor = pre_len + 80 if not new_el_seen else len(await _page_text(page)) - 8
+        prev_len = len(await _page_text(page))
         stable = 0
         while time.time() < deadline:
-            cur_len = len(_page_text(page))
+            cur_len = len(await _page_text(page))
             if cur_len == prev_len and cur_len > floor:
                 stable += 1
                 if stable >= 3:
@@ -900,23 +908,23 @@ def _wait_and_read(page, site: dict, timeout: int, pre_len: int = 0,
             else:
                 stable = 0
             prev_len = cur_len
-            time.sleep(1)
+            await asyncio.sleep(1)
 
     # --- Extract the response text ---
 
     # 1. Try specific CSS selectors (fast, precise when selectors are current)
-    resp = _read_last_response(page, site)
+    resp = await _read_last_response(page, site)
     if resp:
-        return _make_envelope(agent, resp, pre_counts or {}, page, site, pre_method, pre_url)
+        return await _make_envelope(agent, resp, pre_counts or {}, page, site, pre_method, pre_url)
 
     # 2. Page-text diff: everything new since before we typed, cleaned of UI chrome.
     if pre_len > 0:
-        full = _page_text(page)
+        full = await _page_text(page)
         new_text = full[pre_len:].strip()
         if new_text:
-            return _make_envelope(agent, _clean_diff(new_text), pre_counts or {}, page, site, pre_method, pre_url)
+            return await _make_envelope(agent, _clean_diff(new_text), pre_counts or {}, page, site, pre_method, pre_url)
 
-    _save_debug(page, agent, "04_no_response_captured")
+    await _save_debug(page, agent, "04_no_response_captured")
     return _error_envelope(agent, "[No response captured — check the browser window]")
 
 
@@ -965,10 +973,10 @@ def _clean_diff(text: str) -> str:
     return result if result else text.strip()
 
 
-def _make_envelope(agent: str, payload: str, pre_counts: dict,
-                   page, site, pre_method: str = "fallback",
-                   pre_url: str = "", grace_retries: int = 3,
-                   grace_interval: float = 0.25, timing: dict | None = None) -> dict:
+async def _make_envelope(agent: str, payload: str, pre_counts: dict,
+                          page, site, pre_method: str = "fallback",
+                          pre_url: str = "", grace_retries: int = 3,
+                          grace_interval: float = 0.25, timing: dict | None = None) -> dict:
     """Wrap a scraped response in a lineage envelope.
 
     Captures pre/post DOM element counts so app.py can reject stale reads
@@ -996,28 +1004,28 @@ def _make_envelope(agent: str, payload: str, pre_counts: dict,
     url_changed = bool(pre_url and page.url != pre_url)
     warnings: list[str] = []
 
-    def _sample():
+    async def _sample():
         try:
             if pre_method == "semantic" and site.get("semantic_sel"):
-                counts = _semantic_counts(page, site)
+                counts = await _semantic_counts(page, site)
                 method = "semantic"
             else:
-                counts = _response_counts(page, site)
+                counts = await _response_counts(page, site)
                 method = "fallback"
             return sum(counts.values()), method, None
         except Exception as exc:
             return pre_idx, "error", exc
 
-    new_idx, capture_method, err = _sample()
+    new_idx, capture_method, err = await _sample()
     if err is not None:
         warnings.append(f"Post-count error: {err}")
 
     retries_used = 0
     if not url_changed and new_idx <= pre_idx and capture_method != "error":
         for _ in range(grace_retries):
-            time.sleep(grace_interval)
+            await asyncio.sleep(grace_interval)
             retries_used += 1
-            new_idx, capture_method, err = _sample()
+            new_idx, capture_method, err = await _sample()
             if err is not None:
                 warnings.append(f"Post-count error on grace retry: {err}")
                 break
@@ -1092,15 +1100,15 @@ def _error_envelope(agent: str, message: str, timing: dict | None = None,
     }
 
 
-def _read_last_response(page, site: dict) -> str:
+async def _read_last_response(page, site: dict) -> str:
     resp_sels = site.get("response_sel", [])
     if isinstance(resp_sels, str):
         resp_sels = [resp_sels]
     for sel in resp_sels:
         try:
-            elements = page.locator(sel).all()
+            elements = await page.locator(sel).all()
             if elements:
-                text = elements[-1].inner_text().strip()
+                text = (await elements[-1].inner_text()).strip()
                 if text:  # any non-empty text from a specific selector is valid
                     return text
         except Exception:
@@ -1114,6 +1122,18 @@ class BrowserManager:
     """
     Connects to an already-running Chrome via CDP (port 9222).
     Agents map to existing tabs by URL match — no new Chrome windows opened.
+
+    Internals run on ONE dedicated OS thread (self._thread) which owns ONE
+    asyncio event loop and ONE playwright.async_api CDP connection -- this is
+    still the single-connection model the rest of this codebase depends on,
+    just with async/await instead of blocking sync calls inside that one
+    loop. async gives real concurrency *within* a single send_batch call
+    (e.g. waiting on several agents' responses via asyncio.as_completed
+    instead of a fixed time.sleep(0.75) round-robin poll) without opening a
+    second connection or a thread pool -- do not "fix" this by adding either.
+    The public methods below (_call and everything that uses it) are still
+    plain synchronous calls from the caller's (Streamlit) thread; only the
+    inside of the worker thread became async.
     """
 
     def __init__(self):
@@ -1140,74 +1160,79 @@ class BrowserManager:
     # ── Thread ───────────────────────────────────────────────────────────────
 
     def _run(self):
+        """Thread target: owns the asyncio event loop for this whole connection."""
         try:
-            from playwright.sync_api import sync_playwright
-            with sync_playwright() as pw:
-                try:
-                    self._browser = pw.chromium.connect_over_cdp(CDP_URL)
-                    # Hide webdriver flag and arm auto-resume on every page globally
-                    for ctx in self._browser.contexts:
-                        try:
-                            ctx.add_init_script(
-                                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
-                            )
-                            ctx.on("page", self._arm_auto_resume)
-                        except Exception:
-                            pass
-                    self._ready_q.put(("ok", None))
-                except Exception as e:
-                    _log.error(f"CDP connection failed ({CDP_URL}) — {e}", exc_info=True)
-                    self._ready_q.put(("error", str(e)))
-                    return
-
-                while True:
-                    try:
-                        cmd = self._cmd_q.get(timeout=0.3)
-                    except queue.Empty:
-                        self._heartbeat()
-                        continue
-
-                    if cmd is None:
-                        break
-
-                    action, agent, payload, res_q = cmd
-                    try:
-                        if   action == "scan":         self._do_scan(res_q)
-                        elif action == "assign":       self._do_assign(agent, payload, res_q)
-                        elif action == "open_tab":     self._do_open_tab(agent, payload, res_q)
-                        elif action == "send":         self._do_send(agent, payload, res_q)
-                        elif action == "send_batch":   self._do_send_batch(payload, res_q)
-                        elif action == "fast_health":  self._do_fast_health(agent, res_q)
-                        elif action == "full_health":  self._do_full_health(agent, res_q)
-                        elif action == "unassign":
-                            self._pages.pop(agent, None)
-                            res_q.put(("ok", None))
-                        elif action == "list":
-                            alive = [n for n, p in self._pages.items() if not p.is_closed()]
-                            res_q.put(("ok", alive))
-                        elif action == "duplicates":
-                            # Group agents by page object identity (id(page)).
-                            # Returns list of sets where each set has > 1 agent
-                            # sharing the same physical tab.
-                            from collections import defaultdict
-                            groups: dict = defaultdict(list)
-                            for n, p in self._pages.items():
-                                if not p.is_closed():
-                                    groups[id(p)].append(n)
-                            dupes = [sorted(v) for v in groups.values() if len(v) > 1]
-                            res_q.put(("ok", dupes))
-                        elif action == "has":
-                            page = self._pages.get(agent)
-                            res_q.put(("ok", page is not None and not page.is_closed()))
-                    except Exception as e:
-                        _log.error(f"[action={action}, agent={agent}] Unhandled dispatch error — {e}", exc_info=True)
-                        res_q.put(("error", str(e)))
+            asyncio.run(self._run_async())
         except Exception as e:
             _log.critical(f"BrowserManager thread crashed — {e}", exc_info=True)
             try:
                 self._ready_q.put(("error", str(e)))
             except Exception:
                 pass
+
+    async def _run_async(self):
+        from playwright.async_api import async_playwright
+        async with async_playwright() as pw:
+            try:
+                self._browser = await pw.chromium.connect_over_cdp(CDP_URL)
+                # Hide webdriver flag and arm auto-resume on every page globally
+                for ctx in self._browser.contexts:
+                    try:
+                        await ctx.add_init_script(
+                            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
+                        )
+                        ctx.on("page", lambda page: asyncio.ensure_future(self._arm_auto_resume(page)))
+                    except Exception:
+                        pass
+                self._ready_q.put(("ok", None))
+            except Exception as e:
+                _log.error(f"CDP connection failed ({CDP_URL}) — {e}", exc_info=True)
+                self._ready_q.put(("error", str(e)))
+                return
+
+            loop = asyncio.get_event_loop()
+            while True:
+                try:
+                    cmd = await loop.run_in_executor(None, self._cmd_q.get, True, 0.3)
+                except queue.Empty:
+                    self._heartbeat()
+                    continue
+
+                if cmd is None:
+                    break
+
+                action, agent, payload, res_q = cmd
+                try:
+                    if   action == "scan":         await self._do_scan(res_q)
+                    elif action == "assign":       await self._do_assign(agent, payload, res_q)
+                    elif action == "open_tab":     await self._do_open_tab(agent, payload, res_q)
+                    elif action == "send":         await self._do_send(agent, payload, res_q)
+                    elif action == "send_batch":   await self._do_send_batch(payload, res_q)
+                    elif action == "fast_health":  await self._do_fast_health(agent, res_q)
+                    elif action == "full_health":  await self._do_full_health(agent, res_q)
+                    elif action == "unassign":
+                        self._pages.pop(agent, None)
+                        res_q.put(("ok", None))
+                    elif action == "list":
+                        alive = [n for n, p in self._pages.items() if not p.is_closed()]
+                        res_q.put(("ok", alive))
+                    elif action == "duplicates":
+                        # Group agents by page object identity (id(page)).
+                        # Returns list of sets where each set has > 1 agent
+                        # sharing the same physical tab.
+                        from collections import defaultdict
+                        groups: dict = defaultdict(list)
+                        for n, p in self._pages.items():
+                            if not p.is_closed():
+                                groups[id(p)].append(n)
+                        dupes = [sorted(v) for v in groups.values() if len(v) > 1]
+                        res_q.put(("ok", dupes))
+                    elif action == "has":
+                        page = self._pages.get(agent)
+                        res_q.put(("ok", page is not None and not page.is_closed()))
+                except Exception as e:
+                    _log.error(f"[action={action}, agent={agent}] Unhandled dispatch error — {e}", exc_info=True)
+                    res_q.put(("error", str(e)))
 
     def _resolve_site(self, agent: str) -> Optional[dict]:
         """site_for_agent, but honoring any explicit override set via assign_tab/open_tab."""
@@ -1225,7 +1250,7 @@ class BrowserManager:
                 pages.extend(ctx.pages)
         return pages
 
-    def _do_scan(self, res_q):
+    async def _do_scan(self, res_q):
         tabs = []
         for p in self._all_pages():
             try:
@@ -1233,17 +1258,17 @@ class BrowserManager:
             except Exception:
                 continue          # page is completely broken — skip it
             try:
-                title = p.title() # CDP call — can hang on an unresponsive tab
+                title = await p.title() # CDP call — can hang on an unresponsive tab
             except Exception:
                 title = ""        # title is display-only; don't stall the whole scan
-            marker = _read_page_agent_marker(p)
+            marker = await _read_page_agent_marker(p)
             tabs.append({
                 "url": url, "title": title, "marker": marker,
                 "classification": classify_tab_url(url),
             })
         res_q.put(("ok", tabs))
 
-    def _do_assign(self, agent: str, payload, res_q):
+    async def _do_assign(self, agent: str, payload, res_q):
         if isinstance(payload, tuple):
             page_index, site_key = payload
         else:
@@ -1253,22 +1278,29 @@ class BrowserManager:
             if site_key:
                 self._site_overrides[agent] = site_key
             self._pages[agent] = pages[page_index]
-            _mark_page_for_agent(pages[page_index], agent)
+            await _mark_page_for_agent(pages[page_index], agent)
             res_q.put(("ok", None))
         else:
             res_q.put(("error", f"Tab index {page_index} out of range"))
 
-    def _arm_auto_resume(self, page) -> None:
+    async def _arm_auto_resume(self, page) -> None:
         """Auto-resume debugger pauses — keeps cdp ref alive so listener isn't GC'd."""
         try:
-            cdp = page.context.new_cdp_session(page)
-            cdp.send("Debugger.enable")
-            cdp.on("Debugger.paused", lambda _: cdp.send("Debugger.resume"))
+            cdp = await page.context.new_cdp_session(page)
+            await cdp.send("Debugger.enable")
+
+            async def _resume(_evt=None):
+                try:
+                    await cdp.send("Debugger.resume")
+                except Exception:
+                    pass
+
+            cdp.on("Debugger.paused", lambda evt=None: asyncio.ensure_future(_resume(evt)))
             self._cdp_sessions.append(cdp)  # prevent garbage collection
         except Exception:
             pass
 
-    def _do_open_tab(self, agent: str, site_key: str, res_q):
+    async def _do_open_tab(self, agent: str, site_key: str, res_q):
         if site_key:
             self._site_overrides[agent] = site_key
         site = self._resolve_site(agent)
@@ -1278,21 +1310,21 @@ class BrowserManager:
         try:
             ctx = self._browser.contexts[0]
             # new_page() triggers ctx.on("page") which arms auto-resume globally
-            page = ctx.new_page()
+            page = await ctx.new_page()
             # "commit" returns as soon as the server responds — before JS runs.
             # Assign after goto so a failed navigation doesn't leave a broken entry.
-            page.goto(site["url"], wait_until="commit", timeout=15_000)
+            await page.goto(site["url"], wait_until="commit", timeout=15_000)
             self._pages[agent] = page
-            _mark_page_for_agent(page, agent)
+            await _mark_page_for_agent(page, agent)
             res_q.put(("ok", None))
         except Exception as e:
             try:
-                page.close()
+                await page.close()
             except Exception:
                 pass
             res_q.put(("error", str(e)))
 
-    def _do_fast_health(self, agent: str, res_q):
+    async def _do_fast_health(self, agent: str, res_q):
         """Check tab existence, URL, input visibility, identity marker,
         semantic count — no prompt sent. Doubles as the per-agent transport
         preflight check: marker/semantic_count are reported regardless of
@@ -1309,13 +1341,13 @@ class BrowserManager:
             res_q.put(("ok", result))
             return
 
-        marker = _read_page_agent_marker(page)
+        marker = await _read_page_agent_marker(page)
         result["marker"]    = marker
         result["marker_ok"] = (not marker) or (marker == agent)  # unmarked = OK, present-and-wrong = not
 
         if site is not None:
             try:
-                result["semantic_count"] = sum(_semantic_counts(page, site).values())
+                result["semantic_count"] = sum((await _semantic_counts(page, site)).values())
             except Exception:
                 pass
 
@@ -1331,7 +1363,7 @@ class BrowserManager:
             return
 
         try:
-            el = _resolve_selector(page, site.get("input", []), timeout=2000, prefer_latest=False)
+            el = await _resolve_selector(page, site.get("input", []), timeout=2000, prefer_latest=False)
             if el is None:
                 if site.get("experimental"):
                     result["reason"] = "unsupported — claude.ai/code has no known composer/send/response selectors yet"
@@ -1353,7 +1385,7 @@ class BrowserManager:
         result["url"] = page.url[:80]
         res_q.put(("ok", result))
 
-    def _do_full_health(self, agent: str, res_q):
+    async def _do_full_health(self, agent: str, res_q):
         """Send a tiny probe message and verify the response — slow path."""
         _PROBE = "Reply with exactly these two words and nothing else: health-ok"
         page = self._pages.get(agent)
@@ -1366,11 +1398,11 @@ class BrowserManager:
             return
 
         try:
-            pre_counts = _semantic_counts(page, site)
+            pre_counts = await _semantic_counts(page, site)
             pre_url = page.url
-            _type_and_submit(page, site, _PROBE, agent)
-            envelope = _wait_and_read(page, site, timeout=30,
-                                      pre_len=len(_page_text(page)),
+            await _type_and_submit(page, site, _PROBE, agent)
+            envelope = await _wait_and_read(page, site, timeout=30,
+                                      pre_len=len(await _page_text(page)),
                                       pre_counts=pre_counts, agent=agent,
                                       pre_method="semantic", pre_url=pre_url)
             response = envelope.get("payload", "")
@@ -1390,7 +1422,7 @@ class BrowserManager:
 
         res_q.put(("ok", result))
 
-    def _do_send(self, agent: str, payload, res_q):
+    async def _do_send(self, agent: str, payload, res_q):
         page = self._pages.get(agent)
         if page is None or page.is_closed():
             res_q.put(("error", f"No tab assigned to '{agent}' — assign one in Agents."))
@@ -1400,38 +1432,45 @@ class BrowserManager:
             res_q.put(("error", f"Unknown site for agent '{agent}'"))
             return
         msg, timeout, attachment = payload
-        ok, marker = _verify_tab_identity(page, agent)
+        ok, marker = await _verify_tab_identity(page, agent)
         if not ok:
             res_q.put(("error", f"[Error: TAB_IDENTITY_MISMATCH — expected '{agent}', got '{marker}']"))
             return
-        page.bring_to_front()
+        await page.bring_to_front()
         context_mode = "inline"
         if attachment:
-            if _attach_file(page, site, attachment["path"], agent):
+            if await _attach_file(page, site, attachment["path"], agent):
                 msg = attachment["pointer"]
                 context_mode = "file"
             else:
                 context_mode = "file_failed_fallback_inline"
-        pre_len = len(_page_text(page))            # snapshot before typing
-        pre_counts = _semantic_counts(page, site)  # element counts before typing
+        pre_len = len(await _page_text(page))            # snapshot before typing
+        pre_counts = await _semantic_counts(page, site)  # element counts before typing
         pre_method = "semantic" if site.get("semantic_sel") else "fallback"
         pre_url = page.url
-        submit_timing = _type_and_submit(page, site, msg, agent)
+        submit_timing = await _type_and_submit(page, site, msg, agent)
         _t_wait_start = time.time()
-        envelope = _wait_and_read(page, site, timeout, pre_len, pre_counts, agent, pre_method, pre_url)
+        envelope = await _wait_and_read(page, site, timeout, pre_len, pre_counts, agent, pre_method, pre_url)
         envelope["timing"] = {**submit_timing, "wait_response_ms": int((time.time() - _t_wait_start) * 1000)}
         envelope["site_key"] = site.get("key", "")
         envelope["context_mode"] = context_mode
         res_q.put(("ok", envelope))
 
-    def _do_send_batch(self, payloads: dict, res_q):
-        """Submit to all agents sequentially (fast), then poll all round-robin.
+    async def _do_send_batch(self, payloads: dict, res_q):
+        """Submit to all agents sequentially (fast), then wait on all of them
+        concurrently via asyncio.as_completed (each agent gets its own
+        independent poll task on this same single event loop/CDP connection).
 
-        payloads: {agent_name: (message_str, timeout_seconds)}
-        Returns:  {agent_name: reply_str}  — errors embedded as "[Error: …]" strings.
+        payloads: {agent_name: (message_str, timeout_seconds, attachment_or_None)}
+        Returns:  {agent_name: envelope dict}
 
-        Wall-clock time ≈ slowest individual response, not the sum.
-        All Playwright calls stay on this single thread — no thread-safety risk.
+        Wall-clock time ≈ slowest individual response, not the sum. Each
+        per-agent poll task ticks on its own ~0.15s cadence and is reaped via
+        asyncio.as_completed as soon as IT finishes -- replacing the previous
+        fixed time.sleep(0.75) round-robin floor that gated every agent's
+        detection latency on the slowest pass through the whole batch.
+        Still a single asyncio event loop, one thread, one CDP connection --
+        no thread pool, no second connection.
         """
         self._batch_progress = {ag: False for ag in payloads}
         # Step 1: type + submit to every agent in turn (~1-2s each)
@@ -1441,66 +1480,52 @@ class BrowserManager:
             site = self._resolve_site(ag)
             if page is None or page.is_closed() or site is None:
                 state[ag] = {"error": "No tab assigned or unknown site", "failure_stage": "assignment"}
-                _save_debug(page, ag, "batch_02_no_tab") if page else None
+                if page:
+                    await _save_debug(page, ag, "batch_02_no_tab")
                 continue
-            id_ok, id_marker = _verify_tab_identity(page, ag)
+            id_ok, id_marker = await _verify_tab_identity(page, ag)
             if not id_ok:
                 state[ag] = {"error": f"TAB_IDENTITY_MISMATCH — expected '{ag}', got '{id_marker}'",
                              "failure_stage": "assignment"}
-                _save_debug(page, ag, "batch_01_identity_mismatch")
+                await _save_debug(page, ag, "batch_01_identity_mismatch")
                 _log.warning(f"[agent={ag}] Tab identity mismatch — expected '{ag}', tab marked '{id_marker}'")
                 continue
             context_mode = "inline"
             if attachment:
-                if _attach_file(page, site, attachment["path"], ag):
+                if await _attach_file(page, site, attachment["path"], ag):
                     msg = attachment["pointer"]
                     context_mode = "file"
                 else:
                     context_mode = "file_failed_fallback_inline"
             try:
-                # No bring_to_front() here -- CDP dispatches input events
-                # directly to a page's renderer regardless of which tab is
-                # visually frontmost, so switching focus across N tabs in
-                # rapid succession bought nothing functionally and was the
-                # likely cause of the reported "switching tabs is super
-                # slow and almost breaks the system": each switch forces a
-                # real Chrome window-focus change with repaint/visibility-
-                # change overhead, multiplied by every agent, every round.
-                pre_len    = len(_page_text(page))
-                pre_url    = page.url  # capture BEFORE submit for URL-change detection
-                pre_counts = _semantic_counts(page, site)
+                pre_len    = len(await _page_text(page))
+                pre_url    = page.url
+                pre_counts = await _semantic_counts(page, site)
                 pre_method = "semantic" if site.get("semantic_sel") else "fallback"
-                submit_timing = _type_and_submit(page, site, msg, ag, fast_mode=True)
-                # For sites that navigate on submit (e.g. Perplexity home → search
-                # result), the pre_len measured on the old page is useless for the
-                # text-diff fallback.  Re-capture from the NEW page if the URL changed.
+                submit_timing = await _type_and_submit(page, site, msg, ag, fast_mode=True)
                 try:
                     if page.url != pre_url:
-                        page.wait_for_load_state("domcontentloaded", timeout=2000)
-                        pre_len    = len(_page_text(page))
-                        # NOTE: intentionally keep pre_counts from the old page
-                        # (all zeros for Perplexity home) so URL-change validation
-                        # in _make_envelope can detect that 0→0 happened on a
-                        # site that navigates, not a genuine capture failure.
+                        await page.wait_for_load_state("domcontentloaded", timeout=2000)
+                        pre_len    = len(await _page_text(page))
                 except Exception:
                     pass
                 state[ag] = {
                     "page": page, "site": site,
                     "pre_len": pre_len, "pre_counts": pre_counts,
                     "pre_method": pre_method,
-                    "pre_url":  pre_url,  # URL before submit
+                    "pre_url":  pre_url,
                     "prev_len": pre_len,
                     "submit_timing": submit_timing,
                     "context_mode": context_mode,
                     "start": time.time(),
                     "deadline": time.time() + tout,
                     "stable": 0, "stop_seen": False, "new_el_seen": False,
-                    "el_check_at": time.time() + 1,  # first element check after 1s
+                    "el_check_at": time.time() + 1,
                 }
             except Exception as e:
                 _log.error(f"[agent={ag}] Batch type/submit error — {e}", exc_info=True)
                 state[ag] = {"error": str(e), "failure_stage": "insertion"}
-                _save_debug(page, ag, "batch_02_type_error")
+                await _save_debug(page, ag, "batch_02_type_error")
 
         results = {
             a: _error_envelope(a, f"[Error: {s['error']}]",
@@ -1510,44 +1535,42 @@ class BrowserManager:
         }
         for a in results:
             self._batch_progress[a] = True
-        pending  = [a for a in state if "error" not in state[a]]
 
-        # Step 2: round-robin poll until every agent has replied.
-        # No initial sleep — check immediately so we don't miss a fast stop-button
-        # that appears and disappears while we're sleeping.
-        while pending:
-            still = []
-            for ag in pending:
-                s = state[ag]
-                page, site = s["page"], s["site"]
+        pending_agents = [a for a in state if "error" not in state[a]]
 
-                # ── Deadline: try selector extraction before falling back to raw diff
+        async def _poll_one(ag):
+            """Independent per-agent wait loop -- same tiered detection logic
+            as before (stop-button settle, element-count gate, stable-text,
+            deadline fallback), just on its own ~0.15s cadence instead of a
+            shared 0.75s pass so other agents' loops never gate this one's
+            (or vice versa) detection latency.
+            """
+            s = state[ag]
+            page, site = s["page"], s["site"]
+            while True:
                 if time.time() > s["deadline"]:
-                    resp = _read_last_response(page, site)
+                    resp = await _read_last_response(page, site)
                     if not resp:
-                        cur  = _page_text(page)
+                        cur  = await _page_text(page)
                         diff = cur[s["pre_len"]:].strip()
                         resp = _clean_diff(diff) if diff else ""
-                    results[ag] = _make_envelope(ag, resp or "[Timed out]",
-                                                 s["pre_counts"], page, site,
-                                                 s.get("pre_method", "fallback"),
-                                                 s.get("pre_url", ""),
-                                                 timing={**s.get("submit_timing", {}),
-                                                         "wait_response_ms": int((time.time() - s["start"]) * 1000)})
-                    results[ag]["context_mode"] = s.get("context_mode", "inline")
-                    self._batch_progress[ag] = True
-                    _save_debug(page, ag, "batch_05_timeout")
-                    continue
+                    env = await _make_envelope(ag, resp or "[Timed out]",
+                                               s["pre_counts"], page, site,
+                                               s.get("pre_method", "fallback"),
+                                               s.get("pre_url", ""),
+                                               timing={**s.get("submit_timing", {}),
+                                                       "wait_response_ms": int((time.time() - s["start"]) * 1000)})
+                    env["context_mode"] = s.get("context_mode", "inline")
+                    await _save_debug(page, ag, "batch_05_timeout")
+                    return ag, env
 
-                # ── Stop-button (cheapest: single locator count call)
-                # stop_btn may be a string or list of strings (multiple aria-labels).
                 stop_sels = site.get("stop_btn") or []
                 if isinstance(stop_sels, str):
                     stop_sels = [stop_sels]
                 stop_now = False
                 for _ss in stop_sels:
                     try:
-                        if page.locator(_ss).count() > 0:
+                        if await page.locator(_ss).count() > 0:
                             stop_now = True
                             break
                     except Exception:
@@ -1555,87 +1578,69 @@ class BrowserManager:
                 if stop_now:
                     s["stop_seen"] = True
                 if s["stop_seen"] and not stop_now:
-                        # Brief DOM-commit settle: the stop button can disappear
-                        # a frame before the new message element is written to
-                        # the DOM (ChatGPT 8→8 symptom). 350 ms is enough for
-                        # any browser to flush its render queue after generation.
-                        time.sleep(0.35)
-                        resp = _read_last_response(page, site)
-                        if not resp:
-                            resp = _clean_diff(_page_text(page)[s["pre_len"]:].strip())
-                        results[ag] = _make_envelope(ag, resp or "[No response captured]",
-                                                     s["pre_counts"], page, site,
-                                                     s.get("pre_method", "fallback"),
-                                                     s.get("pre_url", ""),
-                                                     timing={**s.get("submit_timing", {}),
-                                                             "wait_response_ms": int((time.time() - s["start"]) * 1000)})
-                        results[ag]["context_mode"] = s.get("context_mode", "inline")
-                        self._batch_progress[ag] = True
-                        continue
+                    await asyncio.sleep(0.35)
+                    resp = await _read_last_response(page, site)
+                    if not resp:
+                        cur = await _page_text(page)
+                        resp = _clean_diff(cur[s["pre_len"]:].strip())
+                    env = await _make_envelope(ag, resp or "[No response captured]",
+                                               s["pre_counts"], page, site,
+                                               s.get("pre_method", "fallback"),
+                                               s.get("pre_url", ""),
+                                               timing={**s.get("submit_timing", {}),
+                                                       "wait_response_ms": int((time.time() - s["start"]) * 1000)})
+                    env["context_mode"] = s.get("context_mode", "inline")
+                    return ag, env
 
-                # ── Element-count gate — also opens on URL change.
-                # Sites like Perplexity navigate from the home page to a search
-                # result page on submit.  Their semantic_sel selectors match the
-                # search page but not the home page, so pre_counts is always 0.
-                # A URL change is unambiguous proof that a new response context
-                # exists; treat it as equivalent to a semantic-element increase.
                 if not s["new_el_seen"]:
                     now = time.time()
                     pre_url = s.get("pre_url", "")
-                    # URL-change gate: navigation = new response context
                     if pre_url and page.url != pre_url:
                         s["new_el_seen"]  = True
-                        s["stable_floor"] = 0  # anything that stops growing is done
+                        s["stable_floor"] = 0
                     elif now >= s["el_check_at"]:
-                        cur_counts = _semantic_counts(page, site)
+                        cur_counts = await _semantic_counts(page, site)
                         if any(cur_counts.get(sel, 0) > n
                                for sel, n in s["pre_counts"].items()):
                             s["new_el_seen"] = True
-                            # Floor for the stable-text check below: once the
-                            # element gate is open we already know real content
-                            # exists, so only require it to stop growing -- not
-                            # another +80 chars on top, which short handshake-
-                            # style replies ("Confirmed.", "[NAME] online.")
-                            # never reach and would otherwise burn the full
-                            # timeout despite having finished immediately.
-                            s["stable_floor"] = len(_page_text(page)) - 8
+                            s["stable_floor"] = len(await _page_text(page)) - 8
                         else:
                             s["el_check_at"] = now + 1.5
-                    still.append(ag)
-                    s["prev_len"] = len(_page_text(page))
+                    s["prev_len"] = len(await _page_text(page))
+                    await asyncio.sleep(0.15)
                     continue
 
-                # ── Stable-text: only fires once element gate is open
-                cur_len = len(_page_text(page))
+                cur_len = len(await _page_text(page))
                 if cur_len == s["prev_len"] and cur_len > s["stable_floor"]:
                     s["stable"] += 1
                     if s["stable"] >= 3:
-                        resp = _read_last_response(page, site)
+                        resp = await _read_last_response(page, site)
                         if not resp:
-                            resp = _clean_diff(_page_text(page)[s["pre_len"]:].strip())
+                            cur = await _page_text(page)
+                            resp = _clean_diff(cur[s["pre_len"]:].strip())
                         if not resp:
-                            _save_debug(page, ag, "batch_04_no_response")
-                        results[ag] = _make_envelope(ag, resp or "[No response captured]",
-                                                     s["pre_counts"], page, site,
-                                                     s.get("pre_method", "fallback"),
-                                                     s.get("pre_url", ""),
-                                                     timing={**s.get("submit_timing", {}),
-                                                             "wait_response_ms": int((time.time() - s["start"]) * 1000)})
-                        results[ag]["context_mode"] = s.get("context_mode", "inline")
-                        self._batch_progress[ag] = True
-                        continue
+                            await _save_debug(page, ag, "batch_04_no_response")
+                        env = await _make_envelope(ag, resp or "[No response captured]",
+                                                   s["pre_counts"], page, site,
+                                                   s.get("pre_method", "fallback"),
+                                                   s.get("pre_url", ""),
+                                                   timing={**s.get("submit_timing", {}),
+                                                           "wait_response_ms": int((time.time() - s["start"]) * 1000)})
+                        env["context_mode"] = s.get("context_mode", "inline")
+                        return ag, env
                 else:
                     s["stable"] = 0
                 s["prev_len"] = cur_len
-                still.append(ag)
+                await asyncio.sleep(0.15)
 
-            pending = still
-            if pending:
-                time.sleep(0.75)
+        if pending_agents:
+            tasks = [asyncio.ensure_future(_poll_one(ag)) for ag in pending_agents]
+            for fut in asyncio.as_completed(tasks):
+                ag, env = await fut
+                results[ag] = env
+                self._batch_progress[ag] = True
 
         res_q.put(("ok", results))
-
-    # ── Public API ────────────────────────────────────────────────────────────
 
     def _call(self, action: str, agent: str = "", payload=None, timeout: int = 40):
         res_q = queue.Queue()
