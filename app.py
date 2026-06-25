@@ -451,6 +451,7 @@ def append_display(sid: str, event: dict) -> None:
         f.write(json.dumps(event) + "\n")
 
 DEBUG_DIR = Path(__file__).parent / "debug"
+CONTEXT_DIR = Path(__file__).parent / "context_files"
 
 def _dump_payloads_to_disk(payloads: dict) -> None:
     """Write the exact outgoing string for every browser agent this round to
@@ -583,6 +584,7 @@ def render_display(sid: str) -> None:
                             "capture":      d.get("capture_method") or "—",
                             "state":        d.get("reply_state") or "—",
                             "fail_stage":   d.get("failure_stage") or "—",
+                            "context":      d.get("context_mode") or "inline",
                         })
                     st.table(rows)
 
@@ -787,6 +789,14 @@ _MAX_CROSS_CHARS        = 1500   # per-agent cap (normal sessions)
 _CROSS_CONTEXT_THRESHOLD = 16_000  # total chars across all agents before tightening
 _CROSS_CONTEXT_TIGHT_CAP = 600    # per-agent cap when over threshold
 
+# File mode (opt-in, off by default — see "📎 File mode" control panel toggle):
+# above this many chars, the outgoing message is written to disk and an
+# attach attempt is made instead of pasting the full text inline. Existing
+# cross-context caps above already keep most rounds well under this; this
+# only kicks in for rounds that are still large after those caps (many
+# agents each near _MAX_CROSS_CHARS, plus the round-1 system prompt, etc.).
+_FILE_ATTACH_THRESHOLD_CHARS = 3000
+
 # Sentinels Relay itself produces when a browser agent's round failed --
 # a typed-but-never-sent message, a timeout, a missing tab, etc. These must
 # never be treated as a real reply: broadcasting "[Error: ...]" to every
@@ -937,6 +947,35 @@ def _build_cross_context(sid: str, my_name: str, participants: dict) -> str:
     return header + "The other panelists said:\n\n" + "\n\n".join(parts)
 
 
+def _prepare_attachment(sid: str, name: str, round_id: int, full_msg: str) -> "dict | None":
+    """Opt-in "File mode" hook: write `full_msg` to disk and return an
+    attachment dict ({"path", "pointer"}) for browser_relay's _attach_file,
+    or None if File mode is off or the message is small enough to just
+    paste inline as today.
+
+    browser_relay falls back to typing `full_msg` itself if the (unverified)
+    file-input selectors fail to attach — File mode can only skip a big
+    paste, never drop content.
+    """
+    if not st.session_state.get(f"ctrl_file_mode_{sid}", False):
+        return None
+    if len(full_msg) < _FILE_ATTACH_THRESHOLD_CHARS:
+        return None
+    try:
+        CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = CONTEXT_DIR / f"context_{sid}_{name}_r{round_id}_{stamp}.txt"
+        path.write_text(full_msg, encoding="utf-8")
+    except Exception:
+        return None
+    pointer = (
+        "This round's full context (other panelists' replies and/or the "
+        "system prompt, plus your next prompt) is attached as a text file — "
+        "please read it and respond accordingly."
+    )
+    return {"path": str(path), "pointer": pointer}
+
+
 def _build_browser_msg(sid: str, name: str, cfg, active: dict, user_msg: str) -> str:
     """Build the message string to paste into a browser agent's chat box.
 
@@ -1024,10 +1063,14 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
     # is_first inside _build_browser_msg checks whether the agent has replied
     # before — that check is only valid on the pre-update history.
     payloads: dict = {}
+    attachments: dict = {}
     construction_ms: dict = {}
     for name, cfg in browser_agents.items():
         _t0 = time.time()
         payloads[name] = _build_browser_msg(sid, name, cfg, active, user_msg)
+        attach = _prepare_attachment(sid, name, round_id, payloads[name])
+        if attach:
+            attachments[name] = attach
         construction_ms[name] = int((time.time() - _t0) * 1000)
         _log.info(f"[sid={sid}, round={round_id}, agent={name}] "
                  f"prompt_chars={len(payloads[name])}")
@@ -1068,7 +1111,7 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
         _outcome: dict = {}
         def _run_batch():
             try:
-                _outcome["batch"] = mgr.send_batch(payloads)
+                _outcome["batch"] = mgr.send_batch(payloads, attachments=attachments)
             except Exception as e:
                 _outcome["error"] = e
         _t = threading.Thread(target=_run_batch, daemon=True)
@@ -1205,11 +1248,13 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
 
             timing = raw.get("timing") or {}
             if isinstance(raw, dict):
+                attach = attachments.get(name)
                 raw["diagnostics"] = {
                     "round_id":           round_id,
                     "agent":              name,
                     "prompt_chars":       len(payloads.get(name, "") or ""),
-                    "files_included":     [],
+                    "files_included":     [attach["path"]] if attach else [],
+                    "context_mode":       raw.get("context_mode") or "inline",
                     "tab_classification": raw.get("site_key") or None,
                     "construction_ms":    construction_ms.get(name),
                     "insertion_ms":       timing.get("insertion_ms"),
@@ -1437,11 +1482,16 @@ def retry_failed_agents(sid: str, participants: dict) -> int:
 
     payloads = {n: _build_browser_msg(sid, n, c, participants, last_prompt)
                 for n, c in browser_failed.items()}
+    attachments = {}
+    for n in browser_failed:
+        attach = _prepare_attachment(sid, n, round_id, payloads[n])
+        if attach:
+            attachments[n] = attach
 
     _set_agent_statuses({n: "Sending" for n in browser_failed})
     with st.spinner(f"Retrying {', '.join(browser_failed)} …"):
         try:
-            batch = mgr.send_batch(payloads)
+            batch = mgr.send_batch(payloads, attachments=attachments)
         except Exception as e:
             _log.error(f"[sid={sid}, round={round_id}] Retry transport error — {e}", exc_info=True)
             st.error(f"⚠️ Retry transport error: {e}")
@@ -1623,6 +1673,7 @@ if mode == "Conversations":
             _k_rounds  = f"ctrl_rounds_{sid}"
             _k_synth   = f"ctrl_synth_{sid}"
             _k_concise = f"ctrl_concise_{sid}"
+            _k_filemode = f"ctrl_file_mode_{sid}"
             # Seed defaults only on first render for this session
             if _k_agents not in st.session_state:
                 st.session_state[_k_agents] = list(participants.keys())
@@ -1655,7 +1706,7 @@ if mode == "Conversations":
                 with cp3:
                     st.metric("Round", meta.get("round_count", 0))
 
-                ctrl1, ctrl2, ctrl3, ctrl4, ctrl5, ctrl6, ctrl7 = st.columns(7)
+                ctrl1, ctrl2, ctrl3, ctrl4, ctrl5, ctrl6, ctrl7, ctrl8 = st.columns(8)
                 with ctrl1:
                     synthesize = st.toggle("🔮 Synthesize", value=True, key=_k_synth)
                 with ctrl2:
@@ -1684,6 +1735,15 @@ if mode == "Conversations":
                                              "only the latest reply from each other agent (not the full "
                                              "transcript) as cross-context — shrinks prompt size, doesn't "
                                              "change tab/transport behavior.")
+                with ctrl8:
+                    file_mode = st.toggle("📎 File mode", value=False, key=_k_filemode,
+                                          help="Experimental, off by default. When a round's outgoing "
+                                               "message is large, write it to a local file and try to "
+                                               "attach it instead of pasting the full text — meant to "
+                                               "avoid large-paste batch errors on some sites. File-input "
+                                               "selectors are unverified guesses: if attaching fails, the "
+                                               "full text is typed inline instead, so content is never "
+                                               "silently dropped.")
 
                 _loop = _get_auto_loop(sid)
                 if _loop is None:

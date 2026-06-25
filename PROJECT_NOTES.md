@@ -205,6 +205,43 @@ logged per agent per round (`relay.log`) and shown in the diagnostics
 table regardless of whether concise mode is on, so a size improvement is
 directly observable, not just assumed.
 
+## File mode (experimental, off by default)
+
+The 📎 **File mode** control-panel toggle addresses large pasted text
+occasionally tripping up a composer (slow re-render, paste timing out,
+what users see as a "batch error") on rounds where the outgoing message —
+system prompt, cross-context, or both — is still large even after the
+existing `_MAX_CROSS_CHARS`/`_CROSS_CONTEXT_TIGHT_CAP` truncation:
+
+- `_prepare_attachment()` (app.py) writes the full outgoing message to
+  `context_files/context_{sid}_{agent}_r{round}_{stamp}.txt` whenever File
+  mode is on **and** the message is at least `_FILE_ATTACH_THRESHOLD_CHARS`
+  (3000) chars, returning `{"path", "pointer"}` — `pointer` is a short
+  "see attached file" message used for typing instead of the full text.
+- `BrowserManager.send_batch()`/`send_message()` take an optional
+  `attachments` arg carrying that dict per agent. The worker thread tries
+  `_attach_file()` (browser_relay.py) before typing; `_attach_file` uses
+  each `SITES` entry's new `file_input` selector (`input[type="file"]` —
+  a generic, **UNVERIFIED** guess, not confirmed against any live tab, same
+  caveat as `claude_code`'s composer selectors).
+- **Fallback is mandatory, not optional**: if `_attach_file` returns False
+  for any reason, the worker types the original full message exactly as
+  it would with File mode off. File mode can only ever skip a large paste
+  on success — it can never cause content to be silently dropped on
+  failure. This mirrors the project's established pattern for any
+  unverified-selector capability (see `claude_code`'s `experimental: True`
+  entry above) — default off, never trusted blindly, always a safe fallback.
+- Diagnostics: each agent's `diagnostics` dict gets `context_mode`
+  (`"inline"` / `"file"` / `"file_failed_fallback_inline"`) and
+  `files_included` (the attachment path, if one was written this round),
+  both rendered in the 🔍 Debug/Recovery speed-diagnostics table.
+- **Not verified against a live tab** in this sandbox (no real Chrome/CDP
+  available here) — the `file_input` selector and the resulting attach
+  behavior on each site need confirming with a real tab before relying on
+  File mode in production. Until then, expect `context_mode` to read
+  `file_failed_fallback_inline` on most/all providers, which is the safe
+  (not silently broken) failure mode this was designed for.
+
 ## GitHub is archive/pointer experiment, not default mediator
 
 `github_relay.py` commits one markdown file per topic to a repo,

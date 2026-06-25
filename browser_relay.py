@@ -36,6 +36,11 @@ SITES: dict[str, dict] = {
     "claude_chat": {
         "url":          "https://claude.ai/new",
         "url_match":    "claude.ai",
+        # Best-effort, UNVERIFIED against a live tab — generic file-input
+        # guess used only by the opt-in "File mode" cross-context attachment
+        # feature. _attach_file() never trusts this blindly: a failed attach
+        # always falls back to typing the full inline text, never drops it.
+        "file_input":   ['input[type="file"]'],
         "input":        [
             # Target the contenteditable ProseMirror *inside* the chat-input
             # wrapper first.  Selecting the wrapper div itself makes _did_clear
@@ -83,6 +88,7 @@ SITES: dict[str, dict] = {
         "url":            "https://claude.ai/code",
         "url_match":      "claude.ai/code",
         "experimental":   True,  # selectors below are best-effort guesses, unverified
+        "file_input":     ['input[type="file"]'],
         "input":          [
             '[data-testid="chat-input"] div[contenteditable="true"]',
             'div[contenteditable="true"]',
@@ -96,6 +102,7 @@ SITES: dict[str, dict] = {
     "chatgpt": {
         "url":          "https://chatgpt.com/",
         "url_match":    "chatgpt.com",
+        "file_input":   ['input[type="file"]'],
         "input":        [
             "#prompt-textarea",
             'div[contenteditable="true"][data-virtualkeyboard]',
@@ -109,6 +116,7 @@ SITES: dict[str, dict] = {
     "gemini": {
         "url":          "https://gemini.google.com/",
         "url_match":    "gemini.google.com",
+        "file_input":   ['input[type="file"]'],
         "input":        [
             'rich-textarea div[contenteditable="true"]',
             'div[contenteditable="true"][aria-label]',
@@ -133,6 +141,7 @@ SITES: dict[str, dict] = {
     "perplexity": {
         "url":          "https://www.perplexity.ai/",
         "url_match":    "perplexity.ai",
+        "file_input":   ['input[type="file"]'],
         "input":        [
             # Lexical editor — target by id first, then by attributes
             '#ask-input',
@@ -195,6 +204,7 @@ SITES: dict[str, dict] = {
     "grok": {
         "url":          "https://grok.com/",
         "url_match":    "grok.com",
+        "file_input":   ['input[type="file"]'],
         "input":        ['textarea[placeholder]', 'div[contenteditable="true"]'],
         "stop_btn":     None,
         "send_btn":     None,
@@ -203,6 +213,7 @@ SITES: dict[str, dict] = {
     "copilot": {
         "url":          "https://copilot.microsoft.com/",
         "url_match":    "copilot.microsoft.com",
+        "file_input":   ['input[type="file"]'],
         "input":        ['textarea[placeholder]', 'div[contenteditable="true"]'],
         "stop_btn":     None,
         "send_btn":     None,
@@ -519,6 +530,31 @@ def _verify_prompt_inserted(el, message: str) -> tuple[bool, str]:
     if norm_prefix in norm_actual or norm_suffix in norm_actual:
         return True, actual
     return False, actual
+
+
+def _attach_file(page, site: dict, file_path: str, agent: str = "") -> bool:
+    """Best-effort attach of a local file via the composer's file input.
+
+    site["file_input"] selectors are generic, UNVERIFIED guesses (no live
+    tab has confirmed them against any provider) -- this exists purely to
+    support the opt-in "File mode" cross-context feature. Callers must
+    treat a False return as "use the full inline text instead", never as
+    license to drop the content; this function itself never raises.
+    """
+    sels = site.get("file_input") or []
+    if isinstance(sels, str):
+        sels = [sels]
+    for sel in sels:
+        try:
+            loc = page.locator(sel)
+            if loc.count() == 0:
+                continue
+            loc.first.set_input_files(file_path)
+            return True
+        except Exception:
+            continue
+    _save_debug(page, agent, "file_attach_failed")
+    return False
 
 
 def _type_and_submit(page, site: dict, message: str, agent: str = "",
@@ -1363,12 +1399,19 @@ class BrowserManager:
         if site is None:
             res_q.put(("error", f"Unknown site for agent '{agent}'"))
             return
-        msg, timeout = payload
+        msg, timeout, attachment = payload
         ok, marker = _verify_tab_identity(page, agent)
         if not ok:
             res_q.put(("error", f"[Error: TAB_IDENTITY_MISMATCH — expected '{agent}', got '{marker}']"))
             return
         page.bring_to_front()
+        context_mode = "inline"
+        if attachment:
+            if _attach_file(page, site, attachment["path"], agent):
+                msg = attachment["pointer"]
+                context_mode = "file"
+            else:
+                context_mode = "file_failed_fallback_inline"
         pre_len = len(_page_text(page))            # snapshot before typing
         pre_counts = _semantic_counts(page, site)  # element counts before typing
         pre_method = "semantic" if site.get("semantic_sel") else "fallback"
@@ -1378,6 +1421,7 @@ class BrowserManager:
         envelope = _wait_and_read(page, site, timeout, pre_len, pre_counts, agent, pre_method, pre_url)
         envelope["timing"] = {**submit_timing, "wait_response_ms": int((time.time() - _t_wait_start) * 1000)}
         envelope["site_key"] = site.get("key", "")
+        envelope["context_mode"] = context_mode
         res_q.put(("ok", envelope))
 
     def _do_send_batch(self, payloads: dict, res_q):
@@ -1392,7 +1436,7 @@ class BrowserManager:
         self._batch_progress = {ag: False for ag in payloads}
         # Step 1: type + submit to every agent in turn (~1-2s each)
         state = {}
-        for ag, (msg, tout) in payloads.items():
+        for ag, (msg, tout, attachment) in payloads.items():
             page = self._pages.get(ag)
             site = self._resolve_site(ag)
             if page is None or page.is_closed() or site is None:
@@ -1406,6 +1450,13 @@ class BrowserManager:
                 _save_debug(page, ag, "batch_01_identity_mismatch")
                 _log.warning(f"[agent={ag}] Tab identity mismatch — expected '{ag}', tab marked '{id_marker}'")
                 continue
+            context_mode = "inline"
+            if attachment:
+                if _attach_file(page, site, attachment["path"], ag):
+                    msg = attachment["pointer"]
+                    context_mode = "file"
+                else:
+                    context_mode = "file_failed_fallback_inline"
             try:
                 # No bring_to_front() here -- CDP dispatches input events
                 # directly to a page's renderer regardless of which tab is
@@ -1440,6 +1491,7 @@ class BrowserManager:
                     "pre_url":  pre_url,  # URL before submit
                     "prev_len": pre_len,
                     "submit_timing": submit_timing,
+                    "context_mode": context_mode,
                     "start": time.time(),
                     "deadline": time.time() + tout,
                     "stable": 0, "stop_seen": False, "new_el_seen": False,
@@ -1482,6 +1534,7 @@ class BrowserManager:
                                                  s.get("pre_url", ""),
                                                  timing={**s.get("submit_timing", {}),
                                                          "wait_response_ms": int((time.time() - s["start"]) * 1000)})
+                    results[ag]["context_mode"] = s.get("context_mode", "inline")
                     self._batch_progress[ag] = True
                     _save_debug(page, ag, "batch_05_timeout")
                     continue
@@ -1516,6 +1569,7 @@ class BrowserManager:
                                                      s.get("pre_url", ""),
                                                      timing={**s.get("submit_timing", {}),
                                                              "wait_response_ms": int((time.time() - s["start"]) * 1000)})
+                        results[ag]["context_mode"] = s.get("context_mode", "inline")
                         self._batch_progress[ag] = True
                         continue
 
@@ -1567,6 +1621,7 @@ class BrowserManager:
                                                      s.get("pre_url", ""),
                                                      timing={**s.get("submit_timing", {}),
                                                              "wait_response_ms": int((time.time() - s["start"]) * 1000)})
+                        results[ag]["context_mode"] = s.get("context_mode", "inline")
                         self._batch_progress[ag] = True
                         continue
                 else:
@@ -1608,19 +1663,29 @@ class BrowserManager:
         site_key overrides the inferred site the same way assign_tab does."""
         self._call("open_tab", agent, site_key, timeout=35)
 
-    def send_message(self, agent: str, message: str, timeout: int = 120) -> dict:
+    def send_message(self, agent: str, message: str, timeout: int = 120,
+                      attachment: Optional[dict] = None) -> dict:
         """Returns a lineage envelope (dict with a "payload" key), not a bare
         string -- same shape send_batch's per-agent results already use.
-        """
-        return self._call("send", agent, (message, timeout), timeout=timeout + 30)
 
-    def send_batch(self, payloads: dict, timeout: int = 120) -> dict:
+        attachment, when given, is {"path": str, "pointer": str} -- an
+        opt-in "File mode" hook (see app.py's File mode toggle). If the
+        file fails to attach (unverified selectors), the full `message`
+        text is typed instead -- attachment never causes content loss.
+        """
+        return self._call("send", agent, (message, timeout, attachment), timeout=timeout + 30)
+
+    def send_batch(self, payloads: dict, timeout: int = 120,
+                    attachments: Optional[dict] = None) -> dict:
         """Submit to all agents simultaneously and return {agent: reply}.
 
         payloads: {agent_name: message_str}  (timeout shared across all).
+        attachments: optional {agent_name: {"path": str, "pointer": str}} --
+        see send_message's docstring; same fallback-never-drops guarantee.
         Total wait ≈ slowest agent, not sum of all agents.
         """
-        full_payloads = {a: (msg, timeout) for a, msg in payloads.items()}
+        attachments = attachments or {}
+        full_payloads = {a: (msg, timeout, attachments.get(a)) for a, msg in payloads.items()}
         max_wait = timeout + len(payloads) * 5 + 30
         return self._call("send_batch", payload=full_payloads, timeout=max_wait)
 
