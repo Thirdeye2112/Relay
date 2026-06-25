@@ -208,13 +208,17 @@ def connect_browser() -> None:
 # to drive the actual Claude Code product UI). None of the input selectors
 # in SITES["claude"] exist on that page, so a tab assigned there fails with
 # "Input box not found" every single time -- exclude it from auto-matching.
-def _is_excluded_tab(url: str) -> bool:
-    return "claude.ai/code" in url
+# Passed to find_and_assign as exclude_substr; the worker skips any tab whose
+# url contains it before the url_match / already-claimed checks.
+_EXCLUDED_TAB_SUBSTR = "claude.ai/code"
 
 def auto_assign_tabs(m: "BrowserManager") -> None:
-    """Scan open tabs and assign each browser agent to the first matching tab."""
-    tabs = m.scan_tabs()
-    used: set[int] = set()
+    """Scan open tabs and assign each browser agent to the first matching tab.
+
+    Uses find_and_assign so the find-and-bind happens atomically per agent in a
+    single worker snapshot. The already-claimed guard inside it means two Claude
+    personas (all url_match "claude.ai") can never land on the same tab.
+    """
     for name, cfg in agents_cfg.items():
         if getattr(cfg, "mode", "api") != "browser":
             continue
@@ -223,33 +227,24 @@ def auto_assign_tabs(m: "BrowserManager") -> None:
         site = site_for_agent(name)
         if not site:
             continue
-        for i, tab in enumerate(tabs):
-            if _is_excluded_tab(tab["url"]):
-                continue
-            if site["url_match"] in tab["url"] and i not in used:
-                try:
-                    m.assign_tab(name, i)
-                    used.add(i)
-                except Exception:
-                    pass
-                break
+        try:
+            m.find_and_assign(name, site["url_match"], exclude_substr=_EXCLUDED_TAB_SUBSTR)
+        except Exception:
+            pass
 
 def find_tab_for_agent(m: "BrowserManager", agent_name: str) -> str | None:
-    """Find an open tab matching this agent and assign it. Returns tab URL or None."""
-    tabs = m.scan_tabs()
+    """Find an open tab matching this agent and assign it. Returns tab URL or None.
+
+    Honors the already-claimed guard inside find_and_assign so a persona can
+    never bind a tab another persona already owns.
+    """
     site = site_for_agent(agent_name)
     if not site:
         return None
-    for i, tab in enumerate(tabs):
-        if _is_excluded_tab(tab["url"]):
-            continue
-        if site["url_match"] in tab["url"]:
-            try:
-                m.assign_tab(agent_name, i)
-                return tab["url"]
-            except Exception:
-                continue
-    return None
+    try:
+        return m.find_and_assign(agent_name, site["url_match"], exclude_substr=_EXCLUDED_TAB_SUBSTR)
+    except Exception:
+        return None
 
 def disconnect_browser() -> None:
     m = st.session_state.pop("browser_manager", None)
@@ -414,6 +409,50 @@ def run_synthesis(sid: str, user_msg: str, replies: dict, round_id: int | None =
 
 _MAX_CROSS_CHARS = 1500  # cap each agent's reply before cross-injecting
 
+
+# ── Durable session attachment ─────────────────────────────────────────────────
+# Round-1 payloads carry the user's full attachment, but round 2+ payloads only
+# carry cross-context (other agents' replies). The original source material was
+# dropped after round 1, leaving agents debating a spec they could no longer see.
+# Persist the FIRST attachment to a session file and re-inject a bounded, compact
+# form of it every round so the source stays in view without unbounded growth.
+def _attachment_path(sid: str) -> Path:
+    return SESSIONS_DIR / sid / "attachment.json"
+
+def save_durable_attachment(sid: str, fname: str, ftext: str) -> None:
+    """Persist the first attachment provided in a session. Later attachments do
+    NOT overwrite it -- the durable source is the original spec the panel was
+    convened to discuss."""
+    p = _attachment_path(sid)
+    if p.exists():
+        return
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"name": fname, "content": ftext}, ensure_ascii=False),
+                 encoding="utf-8")
+
+def load_durable_attachment(sid: str):
+    """Return (name, content) for the session's durable attachment, or None."""
+    p = _attachment_path(sid)
+    if not p.exists():
+        return None
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+        return d.get("name", ""), d.get("content", "")
+    except Exception:
+        return None
+
+def _durable_attachment_snippet(sid: str) -> str:
+    """Compact, bounded form of the durable attachment for round 2+ payloads.
+    Reuses the cross-context cap so re-injection can't grow prompts unbounded."""
+    att = load_durable_attachment(sid)
+    if not att:
+        return ""
+    fname, ftext = att
+    snippet = ftext[:_MAX_CROSS_CHARS]
+    if len(ftext) > _MAX_CROSS_CHARS:
+        snippet += "\n[…truncated — full file was sent in the round-1 message]"
+    return f"[Source material — {fname}]:\n{snippet}"
+
 # Sentinels Relay itself produces when a browser agent's round failed --
 # a typed-but-never-sent message, a timeout, a missing tab, etc. These must
 # never be treated as a real reply: broadcasting "[Error: ...]" to every
@@ -498,8 +537,15 @@ def _build_browser_msg(sid: str, name: str, cfg, active: dict, user_msg: str) ->
             f"{sys_msg}\n\n---\n\n{user_msg}"
         )
 
-    cross = _build_cross_context(sid, name, active)
-    return f"{cross}\n\n---\n\nUser: {user_msg}" if cross else user_msg
+    # Round 2+: re-attach a compact form of the durable source material (if any)
+    # alongside the cross-context, independent of round number, so agents keep
+    # seeing the spec they're debating. Both pieces are individually capped so
+    # the payload stays bounded no matter how many rounds run.
+    cross  = _build_cross_context(sid, name, active)
+    attach = _durable_attachment_snippet(sid)
+    segments = [seg for seg in (cross, attach) if seg]
+    segments.append(f"User: {user_msg}")
+    return "\n\n---\n\n".join(segments)
 
 
 def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = True,
@@ -846,6 +892,9 @@ if mode == "Conversations":
                 file_attachment = st.session_state.pop(f"file_content_{sid}", None)
                 if file_attachment:
                     fname, ftext = file_attachment
+                    # Persist the source so round 2+ payloads can re-attach a
+                    # compact form -- otherwise it's only seen in round 1.
+                    save_durable_attachment(sid, fname, ftext)
                     full_msg = f"[File: {fname}]\n```\n{ftext}\n```\n\n{user_input}" if user_input.strip() else f"[File: {fname}]\n```\n{ftext}\n```"
                 else:
                     full_msg = user_input
@@ -967,7 +1016,28 @@ elif mode == "Agents":
                                         st.rerun()
                                     else:
                                         site_key = (site_for_agent(name) or {}).get("url_match", "the site")
-                                        st.session_state[f"tab_err_{name}"] = f"No open {site_key} tab found — open it in Chrome first, then click Find Tab"
+                                        # Distinguish "no claude.ai tab open" from
+                                        # "all claude.ai tabs already claimed by other
+                                        # personas" -- each Claude persona needs its
+                                        # OWN tab, so the fix for the latter is to open
+                                        # another claude.ai tab, not to keep retrying.
+                                        unclaimed_msg = f"No open {site_key} tab found — open it in Chrome first, then click Find Tab"
+                                        if is_claude:
+                                            try:
+                                                tabs = mgr.scan_tabs()
+                                                matching = [
+                                                    t for t in tabs
+                                                    if site_key in t["url"]
+                                                    and _EXCLUDED_TAB_SUBSTR not in t["url"]
+                                                ]
+                                            except Exception:
+                                                matching = []
+                                            if matching:
+                                                unclaimed_msg = (
+                                                    "All open claude.ai tabs are taken — open another "
+                                                    "claude.ai tab in Chrome for this persona."
+                                                )
+                                        st.session_state[f"tab_err_{name}"] = unclaimed_msg
                                         st.rerun()
                             with bc2:
                                 if st.button("Open Tab", key=f"ot_{name}", use_container_width=True):
@@ -981,6 +1051,7 @@ elif mode == "Agents":
                                 st.error(err)
                             if is_claude and not has_tab:
                                 st.caption("💡 Open claude.ai in Chrome, sign in, then **Find Tab**")
+                                st.caption("Each Claude persona needs its own claude.ai tab.")
                     elif is_browser and not mgr:
                         st.caption("Connect Chrome first")
 

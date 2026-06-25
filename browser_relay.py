@@ -637,6 +637,7 @@ class BrowserManager:
                     try:
                         if   action == "scan":       self._do_scan(res_q)
                         elif action == "assign":     self._do_assign(agent, payload, res_q)
+                        elif action == "find_assign":self._do_find_assign(agent, payload, res_q)
                         elif action == "open_tab":   self._do_open_tab(agent, res_q)
                         elif action == "send":       self._do_send(agent, payload, res_q)
                         elif action == "send_batch": self._do_send_batch(payload, res_q)
@@ -672,13 +673,60 @@ class BrowserManager:
         tabs = [{"url": p.url, "title": p.title()} for p in self._all_pages()]
         res_q.put(("ok", tabs))
 
+    def _claimed_by_other(self, agent: str, page) -> Optional[str]:
+        """Return the name of a DIFFERENT agent already bound to this page, or None.
+
+        Identity (`is`) comparison is correct here: Playwright caches one Page
+        object per underlying tab inside the context, so the same tab yields the
+        same Python object across _all_pages() snapshots.
+        """
+        for other, claimed in self._pages.items():
+            if other != agent and claimed is page:
+                return other
+        return None
+
     def _do_assign(self, agent: str, page_index: int, res_q):
         pages = self._all_pages()
         if 0 <= page_index < len(pages):
-            self._pages[agent] = pages[page_index]
+            page = pages[page_index]
+            # One tab per persona: refuse to bind a tab already owned by another
+            # agent. Without this two Claude personas (all url_match "claude.ai")
+            # could share one tab -- routing one persona's payload into the
+            # other's system-primed window and crediting one bubble to both.
+            other = self._claimed_by_other(agent, page)
+            if other:
+                res_q.put(("error", f"Tab already assigned to {other}"))
+                return
+            self._pages[agent] = page
             res_q.put(("ok", None))
         else:
             res_q.put(("error", f"Tab index {page_index} out of range"))
+
+    def _do_find_assign(self, agent: str, payload, res_q):
+        """Atomically find and bind the first eligible tab in ONE snapshot.
+
+        In a single _all_pages() pass: skip pages whose .url raises, skip pages
+        containing exclude_substr, skip pages already claimed by another agent,
+        and bind the first remaining page whose url contains url_match. Doing
+        the scan-and-bind in one worker action (rather than scan-then-assign
+        from app.py) closes the race where two personas pick the same tab
+        between a shared scan and their separate assigns.
+        """
+        url_match, exclude_substr = payload
+        for page in self._all_pages():
+            try:
+                url = page.url
+            except Exception:
+                continue
+            if exclude_substr and exclude_substr in url:
+                continue
+            if self._claimed_by_other(agent, page):
+                continue
+            if url_match in url:
+                self._pages[agent] = page
+                res_q.put(("ok", url))
+                return
+        res_q.put(("ok", None))
 
     def _arm_auto_resume(self, page) -> None:
         """Auto-resume debugger pauses — keeps cdp ref alive so listener isn't GC'd."""
@@ -877,6 +925,13 @@ class BrowserManager:
 
     def assign_tab(self, agent: str, tab_index: int) -> None:
         self._call("assign", agent, tab_index, timeout=5)
+
+    def find_and_assign(self, agent: str, url_match: str,
+                        exclude_substr: Optional[str] = None) -> Optional[str]:
+        """Atomically bind the first eligible tab matching url_match. Returns
+        the bound url, or None if no eligible (unclaimed, non-excluded,
+        matching) tab exists."""
+        return self._call("find_assign", agent, (url_match, exclude_substr), timeout=5)
 
     def open_tab(self, agent: str) -> None:
         """Open a new tab in Chrome and navigate to the agent's site."""
