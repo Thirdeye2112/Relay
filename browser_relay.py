@@ -147,12 +147,19 @@ SITES: dict[str, dict] = {
             'div[dir="auto"]',
         ],
         # semantic_sel: one per completed answer block.
-        # These data-testid values have not matched Perplexity's current DOM;
-        # URL-change detection in _do_send_batch is the primary gate for
-        # Perplexity. These are kept as a best-effort secondary check.
+        # The data-testid values have not been confirmed against current DOM;
+        # URL-change detection in _do_send_batch remains the primary gate for
+        # Perplexity regardless. Broader wildcard candidates added below as
+        # additional secondary checks -- worth trying since the exact
+        # data-testid strings may simply be stale, not because the structural
+        # idea (one container per completed answer) is wrong.
         "semantic_sel": [
             '[data-testid="thread-assistant-response"]',
             '[data-testid="answer"]',
+            "[data-testid*='answer']",
+            "[data-testid*='thread'] article",
+            "article",
+            "[class*='answer']",
         ],
     },
     "grok": {
@@ -183,6 +190,50 @@ def site_for_agent(agent_name: str) -> Optional[dict]:
 
 
 # ── Page helpers ────────────────────────────────────────────────────────────────
+
+_AGENT_MARKER_PREFIX = "RELAY_AGENT:"
+
+def _mark_page_for_agent(page, agent: str) -> None:
+    """Stamp window.name so this tab's identity can be verified later.
+
+    Multiple same-provider personas (e.g. CLAUDE_OPTIMIST, CLAUDE_SKEPTIC,
+    CLAUDE_CODE_ARCHITECT all on claude.ai) cannot be told apart by URL
+    matching alone. window.name persists on the page itself rather than
+    only in Relay's own _pages dict, so a mismatch here means the actual
+    browser tab no longer matches what Relay believes it assigned --
+    catching that class of drift directly instead of inferring it from a
+    confusing downstream symptom like a stale-DOM-read quarantine.
+    """
+    try:
+        page.evaluate("name => { window.name = name; }", f"{_AGENT_MARKER_PREFIX}{agent}")
+    except Exception:
+        pass  # marking is a safeguard, not a hard requirement -- never block assignment on it
+
+
+def _read_page_agent_marker(page) -> str:
+    """Return the agent name a tab is marked for, or '' if unmarked/unreadable."""
+    try:
+        name = page.evaluate("() => window.name || ''")
+    except Exception:
+        return ""
+    if name.startswith(_AGENT_MARKER_PREFIX):
+        return name[len(_AGENT_MARKER_PREFIX):]
+    return ""
+
+
+def _verify_tab_identity(page, agent: str) -> tuple[bool, str]:
+    """Check the tab's marker matches the agent we're about to send to.
+
+    Returns (ok, marker). An empty marker (tab assigned before this feature
+    existed, or evaluate failed) is treated as OK -- this is an added
+    safeguard against drift, not a hard gate that breaks existing sessions.
+    Only a marker that's PRESENT and WRONG is a hard mismatch.
+    """
+    marker = _read_page_agent_marker(page)
+    if not marker:
+        return True, marker
+    return marker == agent, marker
+
 
 def _resolve_selector(page, selectors, timeout: int = 1500, prefer_latest: bool = True):
     """Resolve to a single, VISIBLE matching element.
@@ -339,6 +390,43 @@ def _verify_sent(page, site: dict, el, pre_counts: dict, timeout: float = 4.0,
     return False
 
 
+def _verify_prompt_inserted(el, message: str) -> tuple[bool, str]:
+    """Check the composer actually contains (a meaningful chunk of) the
+    intended message before proceeding to click send.
+
+    Catches a failure class distinct from "send didn't fire": the paste/
+    fill step itself can silently not land (focus loss between click and
+    paste, a clipboard write that raced, an editor that reset a stale DOM
+    node) while the rest of the pipeline proceeds as if it had, and a wrong/
+    disabled send button then gets blamed for something that never had real
+    text behind it.
+
+    Uses a prefix/suffix containment check rather than an exact match --
+    rich-text editors can normalize whitespace, smart-quotes, etc., so a
+    byte-perfect comparison would false-positive on genuinely correct
+    insertions. Whitespace is collapsed on both sides before comparing.
+    """
+    try:
+        actual = (el.evaluate("e => (e.innerText || e.value || '').trim()") or "")
+    except Exception as exc:
+        return False, f"composer read failed: {exc}"
+
+    if not actual:
+        return False, "composer is empty after insertion"
+
+    stripped = message.strip()
+    check_len = min(60, len(stripped))
+    if check_len == 0:
+        return True, actual  # nothing to verify against
+
+    norm_actual = " ".join(actual.split())
+    norm_prefix = " ".join(stripped[:check_len].split())
+    norm_suffix = " ".join(stripped[-check_len:].split())
+    if norm_prefix in norm_actual or norm_suffix in norm_actual:
+        return True, actual
+    return False, actual
+
+
 def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
     el = _resolve_selector(page, site["input"])
     if el is None:
@@ -392,6 +480,17 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
             el = fresh
     except Exception:
         pass  # keep original el if re-resolve fails
+
+    # Verify the intended text actually landed before attempting to send --
+    # a no-op insertion (focus loss, clipboard race, stale node) must not be
+    # allowed to proceed into the send tiers as if real text was waiting there.
+    inserted_ok, actual_text = _verify_prompt_inserted(el, message)
+    if not inserted_ok:
+        _save_debug(page, agent, "02b_prompt_not_inserted")
+        raise RuntimeError(
+            f"Prompt insertion verification failed — composer does not contain "
+            f"the intended message (composer has: {actual_text[:120]!r})"
+        )
 
     pre_counts = _response_counts(page, site)
     pre_url    = page.url  # capture URL for navigation-detection in _verify_sent
@@ -950,13 +1049,15 @@ class BrowserManager:
                 title = p.title() # CDP call — can hang on an unresponsive tab
             except Exception:
                 title = ""        # title is display-only; don't stall the whole scan
-            tabs.append({"url": url, "title": title})
+            marker = _read_page_agent_marker(p)
+            tabs.append({"url": url, "title": title, "marker": marker})
         res_q.put(("ok", tabs))
 
     def _do_assign(self, agent: str, page_index: int, res_q):
         pages = self._all_pages()
         if 0 <= page_index < len(pages):
             self._pages[agent] = pages[page_index]
+            _mark_page_for_agent(pages[page_index], agent)
             res_q.put(("ok", None))
         else:
             res_q.put(("error", f"Tab index {page_index} out of range"))
@@ -984,6 +1085,7 @@ class BrowserManager:
             # Assign after goto so a failed navigation doesn't leave a broken entry.
             page.goto(site["url"], wait_until="commit", timeout=15_000)
             self._pages[agent] = page
+            _mark_page_for_agent(page, agent)
             res_q.put(("ok", None))
         except Exception as e:
             try:
@@ -1072,6 +1174,10 @@ class BrowserManager:
             res_q.put(("error", f"Unknown site for agent '{agent}'"))
             return
         msg, timeout = payload
+        ok, marker = _verify_tab_identity(page, agent)
+        if not ok:
+            res_q.put(("error", f"[Error: TAB_IDENTITY_MISMATCH — expected '{agent}', got '{marker}']"))
+            return
         page.bring_to_front()
         pre_len = len(_page_text(page))           # snapshot before typing
         pre_counts = _response_counts(page, site)  # element counts before typing
@@ -1096,6 +1202,12 @@ class BrowserManager:
             if page is None or page.is_closed() or site is None:
                 state[ag] = {"error": "No tab assigned or unknown site"}
                 _save_debug(page, ag, "batch_02_no_tab") if page else None
+                continue
+            id_ok, id_marker = _verify_tab_identity(page, ag)
+            if not id_ok:
+                state[ag] = {"error": f"TAB_IDENTITY_MISMATCH — expected '{ag}', got '{id_marker}'"}
+                _save_debug(page, ag, "batch_01_identity_mismatch")
+                _log.warning(f"[agent={ag}] Tab identity mismatch — expected '{ag}', tab marked '{id_marker}'")
                 continue
             try:
                 # No bring_to_front() here -- CDP dispatches input events

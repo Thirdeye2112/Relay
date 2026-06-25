@@ -443,6 +443,21 @@ def render_display(sid: str) -> None:
         else:
             st.markdown(f"---\n#### Round {rid}")
 
+        # Transport stats — the real success metric is confirmed rate, not
+        # "no failures": a round passing only via semantic_unconfirmed is
+        # limping, not fixed. Shown unconditionally (not buried in the
+        # collapsed Debug expander) so a provider that's quietly degrading
+        # is easy to spot round over round, not just when something errors.
+        stats_ev = next((e for e in revents if e["type"] == "transport_stats"), None)
+        if stats_ev:
+            s = stats_ev["stats"]
+            st.caption(
+                f"📊 confirmed: {s.get('confirmed', 0)} · "
+                f"semantic_unconfirmed: {s.get('semantic_unconfirmed', 0)} · "
+                f"quarantined: {s.get('quarantined', 0)} · "
+                f"transport_failure: {s.get('transport_failure', 0)}"
+            )
+
         # Collect debug items: payloads + failure notices + lineage warnings
         debug_items       = []
         failures          = []
@@ -595,6 +610,13 @@ def _generate_debug_transcript(sid: str) -> str:
             lines += [f"### [USER] Round {rid}", content[:400], ""]
         elif etype == "synthesis":
             lines += [f"### [SYNTHESIS] Round {rid}", content[:400], ""]
+        elif etype == "transport_stats":
+            s = ev.get("stats", {})
+            lines += [f"### [TRANSPORT STATS] Round {rid}",
+                     f"- confirmed: {s.get('confirmed', 0)}",
+                     f"- semantic_unconfirmed: {s.get('semantic_unconfirmed', 0)}",
+                     f"- quarantined: {s.get('quarantined', 0)}",
+                     f"- transport_failure: {s.get('transport_failure', 0)}", ""]
 
     return "\n".join(lines)
 
@@ -733,6 +755,40 @@ def _validate_payload_quality(payload: str) -> "tuple[bool, str | None]":
     if _is_bad_capture(payload):
         snippet = (payload or "").strip()[:100]
         return False, f"Bad capture marker or prompt echo: {snippet!r}"
+    return True, None
+
+
+def _semantic_unconfirmed_passes_strict_checks(
+    payload: str, outgoing_payload: str, sid: str, name: str
+) -> "tuple[bool, str | None]":
+    """Extra gate specifically for capture_method == "semantic_unconfirmed".
+
+    A bare "non-empty, non-sentinel" check (already applied before this
+    capture_method is even assigned) can't distinguish a genuine new reply
+    from two specific failure shapes that also look "real" by that check
+    alone: an accidental echo of what was just SENT this round, or a stale
+    DOM read that's just the agent's own unchanged previous turn. Keeping
+    semantic_unconfirmed a rare, trustworthy escape hatch instead of a
+    second normal path depends on ruling both out before accepting it.
+    """
+    stripped = (payload or "").strip()
+
+    # Echo check: a long contiguous match against this round's own outgoing
+    # prompt is not a coincidence -- a short shared phrase is normal and
+    # expected (agents often quote each other), a long one is the page
+    # reading back what was typed into it rather than a generated reply.
+    if outgoing_payload:
+        check_len = min(80, len(stripped))
+        if check_len >= 20 and stripped[:check_len] in outgoing_payload:
+            return False, "echo — captured text overlaps with this round's own outgoing prompt"
+
+    # Identity check: character-identical to the agent's own previous reply
+    # means the DOM read landed on old content, not a new generation.
+    history = load_session(sid, name)
+    prev = next((m.content for m in reversed(history) if m.role == "assistant"), None)
+    if prev is not None and prev.strip() == stripped:
+        return False, "identity match — capture is identical to this agent's previous reply (stale read)"
+
     return True, None
 
 
@@ -919,8 +975,12 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
                 st.error(f"⚠️ System Failure Notice: Batch transport error — {e}")
                 batch = {}
 
+        transport_stats = {"confirmed": 0, "semantic_unconfirmed": 0,
+                           "quarantined": 0, "transport_failure": 0}
+
         for name, env in batch.items():
             payload, validated, raw = _extract_reply(env)
+            original_is_failure = _is_relay_failure(payload)  # before any app.py mutation
             # Stamp round_id into the envelope before any other mutation (fix 2:
             # was patched after-the-fact; now complete at write time)
             if isinstance(env, dict):
@@ -947,8 +1007,26 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
                 payload     = f"[Error: {discard_reason}]"
                 quarantined = True
             elif not validated and raw.get("capture_method") == "semantic_unconfirmed":
-                _log.info(f"[sid={sid}, round={round_id}, agent={name}] "
-                         f"Lower-confidence capture kept (semantic_unconfirmed), not quarantined")
+                # semantic_unconfirmed is meant to be a rare escape hatch, not a
+                # second normal path -- a bare "non-empty, non-sentinel" check
+                # can't tell a genuine new reply from an accidental echo of what
+                # was just sent, or a stale read of the agent's OWN unchanged
+                # previous turn. Both look "real" by that check alone.
+                outgoing = payloads.get(name, "")
+                passed, fail_reason = _semantic_unconfirmed_passes_strict_checks(
+                    payload, outgoing, sid, name
+                )
+                if not passed:
+                    pre = raw.get("pre_response_count", "?")
+                    nw  = raw.get("new_response_index", "?")
+                    discard_reason = f"Unconfirmed capture failed strict check — {fail_reason} (count {pre}→{nw})"
+                    payload     = f"[Error: {discard_reason}]"
+                    quarantined = True
+                    _log.warning(f"[sid={sid}, round={round_id}, agent={name}] "
+                                f"semantic_unconfirmed REJECTED — {fail_reason}")
+                else:
+                    _log.info(f"[sid={sid}, round={round_id}, agent={name}] "
+                             f"Lower-confidence capture kept (semantic_unconfirmed, passed strict checks)")
 
             # Quality validation — second line of defense (e.g. prompt echo)
             if not _is_relay_failure(payload):
@@ -970,10 +1048,27 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
             elif _is_relay_failure(payload):
                 _log.warning(f"[sid={sid}, round={round_id}, agent={name}] Relay failure — {payload[:120]}")
 
+            # Tally for the per-round transport-stats summary -- the actual
+            # success metric is confirmed rate, not "no failures": a round
+            # that passes only via semantic_unconfirmed is limping, not fixed.
+            if original_is_failure:
+                transport_stats["transport_failure"] += 1
+            elif quarantined:
+                transport_stats["quarantined"] += 1
+            elif raw.get("capture_method") == "semantic_unconfirmed":
+                transport_stats["semantic_unconfirmed"] += 1
+            else:
+                transport_stats["confirmed"] += 1
+
             raw_envs[name] = raw
             replies[name]  = payload
             status = "Failed" if _is_relay_failure(payload) else "Done"
             _set_agent_statuses({name: status})
+
+        if batch:
+            append_display(sid, {"type": "transport_stats", "round_id": round_id,
+                                 "stats": transport_stats})
+            _log.info(f"[sid={sid}, round={round_id}] Transport stats — {transport_stats}")
 
         for name in browser_agents:
             if name not in replies:
