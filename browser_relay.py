@@ -206,7 +206,22 @@ def _clipboard_insert(page, message: str) -> bool:
             page.context.grant_permissions(["clipboard-write"])
         except Exception:
             pass
-        page.evaluate("async t => { await navigator.clipboard.writeText(t); }", message)
+        # Bound the write: navigator.clipboard.writeText requires the DOCUMENT to
+        # be focused, which a backgrounded batch tab is not -- there the promise
+        # can stall, and an unbounded page.evaluate would block this single
+        # worker thread for the Playwright default (~30s) PER agent (the old
+        # "minute to paste"). Race it against a short timeout so a stalled write
+        # fails fast and we fall through to a focus-free path instead.
+        page.evaluate(
+            """async (args) => {
+                const [t, ms] = args;
+                await Promise.race([
+                    navigator.clipboard.writeText(t),
+                    new Promise((_, rej) => setTimeout(() => rej(new Error('clipboard timeout')), ms)),
+                ]);
+            }""",
+            [message, 1500],
+        )
         time.sleep(0.1)   # let the async write settle
         page.keyboard.press("Control+a")
         time.sleep(0.05)  # let selection register before paste
@@ -216,6 +231,33 @@ def _clipboard_insert(page, message: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _composer_has_text(el) -> bool:
+    """True if the editor currently holds non-empty content."""
+    try:
+        return bool(el.evaluate("e => (e.innerText || e.value || '').trim()"))
+    except Exception:
+        return False
+
+
+def _insert_text_cdp(page, el, message: str) -> bool:
+    """Insert the whole message via CDP Input.insertText (keyboard.insert_text).
+
+    This is the PRIMARY insertion path: unlike the async Clipboard API it needs
+    no OS window focus, only element focus (which el.click() sets over CDP even
+    on a backgrounded batch tab). The text lands as a single input event with
+    newlines kept as text (no Enter -> no Lexical/ProseMirror mid-message
+    submit). Returns True only if the composer actually shows content after, so
+    a silent no-op falls through to the clipboard/execCommand fallbacks.
+    """
+    try:
+        el.click()
+        page.keyboard.insert_text(message)
+        _force_input_events(page)
+    except Exception:
+        return False
+    return _composer_has_text(el)
 
 
 def _did_clear(el) -> bool:
@@ -276,25 +318,30 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "") -> None:
         el.dispatch_event("input")
         el.dispatch_event("change")
     else:
-        # For all contenteditable (Lexical, ProseMirror, etc.) use clipboard paste.
-        # execCommand('insertText') is deprecated in Chrome 90+ and silently drops
-        # text in ProseMirror on current Chrome. keyboard.type() fires real Enter
-        # events on every \n, submitting Lexical forms mid-message.
-        # Clipboard paste avoids both problems. _clipboard_insert already fires
-        # the input/change nudge internally; the fallback paths below need it too.
-        if not _clipboard_insert(page, message):
-            if is_lexical:
-                # Lexical fallback: type without newlines to avoid premature submit
-                page.keyboard.press("Control+a")
-                page.keyboard.type(message.replace("\n", " "))
-            else:
-                # ProseMirror fallback: execCommand (deprecated but may still work)
-                page.evaluate(
-                    "text => { document.execCommand('selectAll'); "
-                    "document.execCommand('insertText', false, text); }",
-                    message,
-                )
-            _force_input_events(page)
+        # For all contenteditable (Lexical, ProseMirror, etc.):
+        # PRIMARY = CDP Input.insertText (focus-free, works on the backgrounded
+        # batch tabs where the async-clipboard route silently failed -- that
+        # failure left the composer empty, the send button disabled, and every
+        # agent grinding through all three submit tiers, i.e. the "minute to
+        # paste"). Fall back to clipboard, then execCommand/Lexical-safe typing,
+        # only if insertText didn't land. execCommand('insertText') is deprecated
+        # in Chrome 90+ and silently drops text in ProseMirror; keyboard.type()
+        # fires real Enter on every \n, submitting Lexical mid-message -- both
+        # are last resorts.
+        if not _insert_text_cdp(page, el, message):
+            if not _clipboard_insert(page, message):
+                if is_lexical:
+                    # Lexical fallback: type without newlines to avoid premature submit
+                    page.keyboard.press("Control+a")
+                    page.keyboard.type(message.replace("\n", " "))
+                else:
+                    # ProseMirror fallback: execCommand (deprecated but may still work)
+                    page.evaluate(
+                        "text => { document.execCommand('selectAll'); "
+                        "document.execCommand('insertText', false, text); }",
+                        message,
+                    )
+                _force_input_events(page)
     time.sleep(0.5)
     _save_debug(page, agent, "02_after_paste")
 
