@@ -472,7 +472,18 @@ def render_display(sid: str) -> None:
     if not p.exists():
         return
 
-    events = [json.loads(ln) for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    # Re-parsing the whole transcript from disk on every single Streamlit
+    # rerun gets slower as a conversation grows. The file is append-only, so
+    # its mtime only changes when new events land -- cache the parsed list
+    # per-session and only re-read when that mtime actually moves.
+    cache_key = f"_display_cache_{sid}"
+    mtime_ns  = p.stat().st_mtime_ns
+    cached    = st.session_state.get(cache_key)
+    if cached and cached[0] == mtime_ns:
+        events = cached[1]
+    else:
+        events = [json.loads(ln) for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        st.session_state[cache_key] = (mtime_ns, events)
 
     # Group events by round_id (0 = pre-session / legacy events)
     from collections import defaultdict
@@ -1438,8 +1449,19 @@ def _advance_auto_loop(sid: str, participants: dict) -> None:
     next_round = rounds_done + 1
     label  = f"Round {next_round}" if n_rounds is None else f"Round {next_round}/{n_rounds}"
     marker = f"🔁 {label} — auto-continuing"
-    run_round(sid, participants, _AUTO_CONTINUE_MSG,
-             synthesize=state.get("synthesize", True), round_label=marker)
+    try:
+        run_round(sid, participants, _AUTO_CONTINUE_MSG,
+                 synthesize=state.get("synthesize", True), round_label=marker)
+    except Exception as e:
+        # An uncaught exception here would crash the whole script before
+        # state["rounds_done"] updates or st.rerun() fires -- the loop's
+        # "active" flag would stay stuck True with no further reruns ever
+        # advancing it, looking like the loop silently died. Stop cleanly
+        # instead so the user sees why and the UI stays usable.
+        _log.error(f"[sid={sid}] Auto-loop round {next_round} failed — {e}", exc_info=True)
+        st.error(f"⚠️ Auto-loop stopped — round {next_round} failed: {e}")
+        state["active"] = False
+        return
 
     state["rounds_done"] = next_round
     if n_rounds is not None and next_round >= n_rounds:
@@ -2180,7 +2202,19 @@ elif mode == "Agents":
                                             st.session_state[f"tab_err_{name}"] = str(e); st.rerun()
                             err = st.session_state.pop(f"tab_err_{name}", None)
                             if err:
-                                st.error(err)
+                                # Claude is the only provider with two distinct page
+                                # types (chat vs. claude.ai/code) that can be open at
+                                # once and confused for each other -- call that out
+                                # explicitly instead of a flat, easy-to-miss st.error,
+                                # since "Find Tab works for everyone but Claude" is
+                                # almost always this, not a real bug.
+                                if "claude.ai/code, but this agent is configured" in err:
+                                    st.warning(f"⚠️ {err}\n\nOpen a normal **claude.ai** chat tab "
+                                               "(not claude.ai/code) and click **Find Tab** again.")
+                                elif "No Claude Code tab found" in err:
+                                    st.warning(f"⚠️ {err}")
+                                else:
+                                    st.error(err)
                             if is_claude and not has_tab:
                                 if site["key"] == "claude_code":
                                     st.caption("💡 Open claude.ai/code in Chrome, then **Find Tab**")

@@ -415,6 +415,65 @@ in this pass — flagged here in case a long-running auto-loop session
 (hundreds of rounds) is ever reported as slow again after this fix; that
 would point at this, not synthesis.
 
+## Auto-loop crash-safety, transcript-render caching, Find Tab Claude warning (this pass)
+
+User reported (live, real Chrome session, not this sandbox) three recurring
+symptoms after prior fixes: an auto-loop set for 3 rounds dying after 1,
+loop sequences still feeling slow despite the Synthesize-default fix, and
+Find Tab still failing for Claude specifically while every other provider
+works.
+
+- **Auto-loop crash safety**: `_advance_auto_loop`'s `run_round(...)` call
+  was unguarded — any exception during an auto-continued round would crash
+  the whole script *before* `state["rounds_done"]` updated or `st.rerun()`
+  fired, leaving `active=True` frozen with no further reruns ever advancing
+  it (looks like the loop silently died after the round before the crash).
+  Now wrapped in try/except: on failure, logs it, shows
+  `st.error(f"⚠️ Auto-loop stopped — round {next_round} failed: {e}")`,
+  sets `state["active"] = False`, and returns cleanly instead of crashing.
+- **`render_display` caching**: the previously-flagged-but-deferred cost
+  (re-parsing the entire `display.jsonl` from disk on every single rerun)
+  is now addressed — the parsed event list is cached in
+  `st.session_state[f"_display_cache_{sid}"]` keyed by the file's
+  `st_mtime_ns`, so a rerun only re-reads/re-parses when new events have
+  actually been appended since the last render. The rendering calls
+  themselves (the `st.markdown`/`st.caption` loop) are unchanged — Streamlit
+  still has to redraw them every rerun by its own model — this only removes
+  the redundant disk read + JSON decode.
+- **Find Tab Claude warning**: Claude is the only provider with two distinct
+  page types (`claude_chat` vs `claude.ai/code`) that can be open
+  simultaneously and confused for each other; `find_tab_for_agent` already
+  returned a specific rejection message for this case, but it rendered as a
+  flat `st.error` easy to miss. The two Claude-specific rejection messages
+  ("Found claude.ai/code, but this agent is configured…" and "No Claude
+  Code tab found…") now render as `st.warning` with an explicit next step
+  ("Open a normal claude.ai chat tab… and click Find Tab again"). This does
+  **not** change `find_tab_for_agent`'s matching logic at all — that logic
+  traced correctly for every standard `claude.ai` URL form
+  (`claude.ai/new`, `claude.ai/chat/<uuid>`, bare `claude.ai`) in
+  `test_relay.py`'s `classify_tab_url` cases. If Find Tab is still failing
+  for Claude after this, the live tab almost certainly *is* a
+  `claude.ai/code` tab (intentionally rejected by design for a chat
+  persona) — confirm via the new warning text before assuming it's a bug.
+- Two other reported symptoms were diagnosed but deliberately **not**
+  code-changed this pass: "pressing stop/new chat mid-loop causes major
+  stoppage" is Streamlit's single-script-per-session model — a click made
+  while a round (or an auto-continuing round, up to ~150s) is in flight
+  cannot be serviced until that script run finishes; the `round_in_progress`
+  flag already fixed the false-disconnect bug this caused, but it can never
+  make Streamlit interrupt a running script, so the wait itself is expected,
+  not a defect. "UI issues between tabs" was too unspecific to safely
+  diagnose blind — flagged back to the user for repro details rather than
+  guessed at.
+- **Not verified against a live Chrome/CDP session** — same sandbox
+  limitation as every other pass in this file. Verified: `ast.parse` on
+  `app.py`, and the full `test_relay.py` suite (32/32, unaffected). A human
+  should confirm: (1) an auto-loop survives a forced exception mid-round
+  without freezing the UI, (2) a long transcript renders without a
+  perceptible re-parse stall after this change, (3) the new Claude warning
+  text actually appears when a `claude.ai/code` tab is open instead of a
+  chat tab.
+
 ## Verification limitations (this pass)
 
 This sandbox has no live Chrome instance or `claude.ai/code` tab, so the
