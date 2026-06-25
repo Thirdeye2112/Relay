@@ -1115,22 +1115,26 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
             except Exception as e:
                 _outcome["error"] = e
         _t = threading.Thread(target=_run_batch, daemon=True)
-        _t.start()
+        st.session_state.round_in_progress = sid
+        try:
+            _t.start()
 
-        status_box = st.empty()
-        while _t.is_alive():
-            prog    = mgr.batch_progress()
-            waiting = [n for n in agent_names if not prog.get(n)]
-            done    = [n for n in agent_names if prog.get(n)]
-            if waiting:
-                text = f"⏳ Waiting for {', '.join(waiting)}…"
-                if done:
-                    text += f"  ✅ done: {', '.join(done)}"
-            else:
-                text = "⏳ Finishing up…"
-            status_box.markdown(text)
-            _t.join(timeout=0.4)
-        status_box.empty()
+            status_box = st.empty()
+            while _t.is_alive():
+                prog    = mgr.batch_progress()
+                waiting = [n for n in agent_names if not prog.get(n)]
+                done    = [n for n in agent_names if prog.get(n)]
+                if waiting:
+                    text = f"⏳ Waiting for {', '.join(waiting)}…"
+                    if done:
+                        text += f"  ✅ done: {', '.join(done)}"
+                else:
+                    text = "⏳ Finishing up…"
+                status_box.markdown(text)
+                _t.join(timeout=0.4)
+            status_box.empty()
+        finally:
+            st.session_state.round_in_progress = None
 
         if "error" in _outcome:
             e = _outcome["error"]
@@ -1489,13 +1493,17 @@ def retry_failed_agents(sid: str, participants: dict) -> int:
             attachments[n] = attach
 
     _set_agent_statuses({n: "Sending" for n in browser_failed})
-    with st.spinner(f"Retrying {', '.join(browser_failed)} …"):
-        try:
-            batch = mgr.send_batch(payloads, attachments=attachments)
-        except Exception as e:
-            _log.error(f"[sid={sid}, round={round_id}] Retry transport error — {e}", exc_info=True)
-            st.error(f"⚠️ Retry transport error: {e}")
-            return 0
+    st.session_state.round_in_progress = sid
+    try:
+        with st.spinner(f"Retrying {', '.join(browser_failed)} …"):
+            try:
+                batch = mgr.send_batch(payloads, attachments=attachments)
+            except Exception as e:
+                _log.error(f"[sid={sid}, round={round_id}] Retry transport error — {e}", exc_info=True)
+                st.error(f"⚠️ Retry transport error: {e}")
+                return 0
+    finally:
+        st.session_state.round_in_progress = None
 
     new_replies: dict = {}
     for name, env in batch.items():
@@ -1534,15 +1542,28 @@ def retry_failed_agents(sid: str, participants: dict) -> int:
 
 # ── Session state ─────────────────────────────────────────────────────────────
 
-if "active_session"  not in st.session_state: st.session_state.active_session  = None
-if "edit_agent"      not in st.session_state: st.session_state.edit_agent      = None
-if "agent_statuses"  not in st.session_state: st.session_state.agent_statuses  = {}
+if "active_session"   not in st.session_state: st.session_state.active_session   = None
+if "edit_agent"       not in st.session_state: st.session_state.edit_agent       = None
+if "agent_statuses"   not in st.session_state: st.session_state.agent_statuses   = {}
+if "round_in_progress" not in st.session_state: st.session_state.round_in_progress = None
+if "cached_active_agents" not in st.session_state: st.session_state.cached_active_agents = {}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Sidebar
 # ══════════════════════════════════════════════════════════════════════════════
 
-active = active_agents()
+# active_agents() does a blocking queue round-trip (list_agents()) against the
+# SAME worker queue a long-running send_batch() occupies for the whole round.
+# If a round is in flight (round_in_progress set), that call would queue
+# behind it and time out after 5s on every single rerun -- including reruns
+# from "instant" actions like Stop After Round -- making the UI falsely
+# report no agents connected and feel hung. Skip it and reuse the last good
+# snapshot while a round is in progress; refresh normally otherwise.
+if st.session_state.round_in_progress:
+    active = st.session_state.cached_active_agents
+else:
+    active = active_agents()
+    st.session_state.cached_active_agents = active
 
 with st.sidebar:
     st.title("⚡ Relay")
@@ -1559,10 +1580,14 @@ with st.sidebar:
                 with c1:
                     is_sel = st.session_state.active_session == s.name
                     label  = ("▶ " if is_sel else "") + session_label(s.name)
-                    if st.button(label, key=f"s_{s.name}", use_container_width=True):
+                    busy_other = (st.session_state.round_in_progress
+                                  and st.session_state.round_in_progress != s.name)
+                    if st.button(label, key=f"s_{s.name}", use_container_width=True,
+                                 disabled=bool(busy_other)):
                         st.session_state.active_session = s.name; st.rerun()
                 with c2:
-                    if st.button("🗑", key=f"d_{s.name}"):
+                    if st.button("🗑", key=f"d_{s.name}",
+                                 disabled=bool(st.session_state.round_in_progress)):
                         if st.session_state.active_session == s.name:
                             st.session_state.active_session = None
                         delete_session(s.name); st.rerun()
@@ -1575,8 +1600,12 @@ with st.sidebar:
             st.caption("  ".join(f"{avatar(n)} {n.upper()}" for n in active))
         else:
             st.caption("⚠ No agents active — launch browsers in **Agents** first.")
+        if st.session_state.round_in_progress:
+            st.caption(f"⏳ A round is in progress in **{st.session_state.round_in_progress}** "
+                       "— wait for it to finish or stop it first.")
         topic        = st.text_input("Topic", placeholder="e.g. Is AGI near?")
-        new_chat_btn = st.button("＋ Start", type="primary", use_container_width=True)
+        new_chat_btn = st.button("＋ Start", type="primary", use_container_width=True,
+                                  disabled=bool(st.session_state.round_in_progress))
 
     elif mode == "Agents":
         st.subheader("Agents")

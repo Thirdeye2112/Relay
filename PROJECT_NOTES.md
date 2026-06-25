@@ -330,6 +330,59 @@ and README.md before making any changes:
 | `PROJECT_NOTES.md` | ABSENT (until this pass) | Did not exist; created as part of this work. |
 | Failure-stage logging (construction/assignment/insertion/send/capture/validation/cross_injection) | PARTIAL → PRESENT (this pass) | Stages existed implicitly in code structure/log messages but were not a named, queryable field on envelopes before this pass; `failure_stage` is now stamped on error envelopes and the new `diagnostics` dict. |
 
+## round_in_progress flag — guarding against concurrent UI actions mid-round (this pass)
+
+User-reported symptoms, all from the same root cause: clicking "+ Start" (new
+conversation) or "🗑" delete in the sidebar while a round is in flight appeared
+to "lose Chrome connection"; the sidebar would say no agents were active even
+though they genuinely were connected; and clicking "⏹ Stop After Round" (a
+trivial flag toggle with no browser I/O) caused a multi-second UI stall.
+
+Root cause: `active_agents()` is called **unconditionally on every Streamlit
+rerun** (near the top of the script, before the sidebar renders), and it does
+a blocking `list_agents()` round-trip (`timeout=5`) against the *same* shared
+worker command queue that `send_batch()` occupies for the full duration of an
+in-flight round (`timeout` + `len(payloads)*5 + 30` seconds — easily 60-150s+).
+While the worker is busy, the queued "list" command starves until its 5s
+timeout, raises `queue.Empty`, which `list_agents()` silently swallows
+(`except Exception: return []`) — so `active_agents()` returns `{}` even
+though the browser connection and every agent tab are perfectly fine. Because
+this call sits at the top of the script, *every* rerun during a busy window —
+including the one triggered by "Stop After Round" — eats this same 5s stall.
+Nothing was actually crashing or disconnecting; the worker thread and CDP
+connection stayed alive throughout.
+
+Fix, entirely in `app.py` (no `browser_relay.py` changes):
+- New `st.session_state.round_in_progress` flag, holding the in-flight
+  session's `sid` or `None`. Set immediately before the two places that
+  block on `mgr.send_batch()` (inside `run_round`'s batch-send block, and
+  inside `retry_failed_agents`), cleared in a `finally` right after. Streamlit
+  preempts a blocked script via a real Python exception, so `finally` still
+  fires on interruption, and the flag survives into the next rerun via
+  session_state — letting that rerun see "still busy" and react accordingly.
+- The unconditional `active = active_agents()` call now checks the flag
+  first: if a round is in progress, reuse `st.session_state.cached_active_agents`
+  (refreshed only on the non-busy path) instead of re-running the doomed
+  live call. Fixes both the false "no agents" reading and the universal
+  per-rerun stall.
+- "+ Start" and the 🗑 delete button are now `disabled=` while
+  `round_in_progress` is set, with a "⏳ round in progress" caption — the
+  literal ask was to turn "new chat while waiting" into a no-op/pause rather
+  than a conflicting action. Switching to a *different* existing session via
+  the sidebar list is also disabled while busy (switching back to the same,
+  already-busy session is still allowed, since it's a no-op).
+- Not changed: `browser_relay.py`'s single shared command queue / single
+  worker thread design — still strictly sequential by design, one CDP
+  connection, no thread pool. This fix only changes how `app.py` *reacts* to
+  that constraint, not the constraint itself.
+- **Not verified against a live Chrome/CDP session** — no real browser
+  available in this sandbox. Verified: `ast.parse` syntax check and the full
+  `test_relay.py` suite (32/32, unaffected — it only parses `app.py`'s AST,
+  it doesn't exercise Streamlit runtime behavior). A human should reproduce
+  the original repro (start a round, immediately click "+ Start" or "⏹ Stop
+  After Round") against a real Chrome instance to confirm the UI now shows
+  the disabled state / cached agent list instead of stalling or misreporting.
+
 ## Verification limitations (this pass)
 
 This sandbox has no live Chrome instance or `claude.ai/code` tab, so the
