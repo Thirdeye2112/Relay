@@ -41,6 +41,7 @@ class AgentConfig:
     system_prompt: str
     mode:          str = "api"   # "api" | "browser"
     base_url:      str = ""
+    site_key:      str = ""   # explicit browser SITES key override, e.g. "claude_code"
 
 @dataclass
 class Message:
@@ -68,6 +69,7 @@ def load_agents() -> dict[str, AgentConfig]:
             system_prompt = cfg.get("system_prompt", ""),
             mode          = cfg.get("mode", "api"),
             base_url      = base_url,
+            site_key      = cfg.get("site_key", ""),
         )
     return agents
 

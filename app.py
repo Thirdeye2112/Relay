@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """relay/app.py — Run: python -m streamlit run app.py"""
 
-import os, sys, json, datetime
+import os, sys, json, datetime, time
 from typing import Optional
 import streamlit as st
 from pathlib import Path
@@ -25,7 +25,8 @@ try:
     _br_mod  = _ilu.module_from_spec(_br_spec)
     _br_spec.loader.exec_module(_br_mod)
     BrowserManager = _br_mod.BrowserManager
-    site_for_agent = _br_mod.site_for_agent
+    site_for_agent  = _br_mod.site_for_agent
+    classify_tab_url = _br_mod.classify_tab_url
     SITES          = _br_mod.SITES
     CDP_URL        = _br_mod.CDP_URL
     PLAYWRIGHT_AVAILABLE = True
@@ -34,7 +35,8 @@ except Exception as _pw_err:
     PLAYWRIGHT_AVAILABLE = False
     PLAYWRIGHT_ERROR = str(_pw_err)
     _log.error(f"Playwright unavailable: {_pw_err}")
-    def site_for_agent(name): return None  # noqa: E704
+    def site_for_agent(name, site_key_override=""): return None  # noqa: E704
+    def classify_tab_url(url): return "unsupported"  # noqa: E704
     SITES = {}
     CDP_URL = "http://localhost:9222"
 
@@ -143,6 +145,7 @@ def save_agents(agents: dict) -> None:
             "model":         c.model,
             "mode":          getattr(c, "mode", "api"),
             "system_prompt": c.system_prompt,
+            **({"site_key": c.site_key} if getattr(c, "site_key", "") else {}),
         }
         for name, c in agents.items()
     }}
@@ -231,18 +234,18 @@ def connect_browser() -> None:
     st.session_state.browser_manager = m
     auto_assign_tabs(m)
 
-# claude.ai/code is Claude Code's IDE web view, not the chat composer --
-# "claude.ai" is a substring of that URL too, so the plain url_match check
-# below would happily hand a Claude Code tab to a chat-persona agent (e.g.
-# claude_code_architect/claude_code_pragmatist are chat personas, not meant
-# to drive the actual Claude Code product UI). None of the input selectors
-# in SITES["claude"] exist on that page, so a tab assigned there fails with
-# "Input box not found" every single time -- exclude it from auto-matching.
-def _is_excluded_tab(url: str) -> bool:
-    return "claude.ai/code" in url
-
 def auto_assign_tabs(m: "BrowserManager") -> None:
-    """Scan open tabs and assign each browser agent to the first matching tab."""
+    """Scan open tabs and assign each browser agent to the first matching tab.
+
+    claude.ai/code is Claude Code's IDE web view, not the chat composer --
+    "claude.ai" is a substring of that URL too, so a plain url_match check
+    would happily hand a Claude Code tab to a chat-persona agent (e.g.
+    claude_code_architect/claude_code_pragmatist are chat personas, not meant
+    to drive the actual Claude Code product UI). classify_tab_url() tells
+    chat tabs apart from /code tabs; auto-assign only ever matches a
+    claude_code-classified tab to an agent that explicitly opted in via
+    site_key == "claude_code" -- never inferred from the agent's name.
+    """
     tabs = m.scan_tabs()
     used: set[int] = set()
     for name, cfg in agents_cfg.items():
@@ -250,39 +253,84 @@ def auto_assign_tabs(m: "BrowserManager") -> None:
             continue
         if m.has_agent(name):
             continue
-        site = site_for_agent(name)
+        site_key_override = getattr(cfg, "site_key", "")
+        site = site_for_agent(name, site_key_override)
         if not site:
             continue
+        wants_code = site["key"] == "claude_code"
         for i, tab in enumerate(tabs):
-            if _is_excluded_tab(tab["url"]):
+            if i in used:
                 continue
-            if site["url_match"] in tab["url"] and i not in used:
-                try:
-                    m.assign_tab(name, i)
-                    used.add(i)
-                except Exception:
-                    pass
-                break
-
-def find_tab_for_agent(m: "BrowserManager", agent_name: str) -> str | None:
-    """Find an open tab matching this agent and assign it. Returns tab URL or None.
-
-    No exclusion filter here — when the user explicitly clicks Find Tab they mean
-    the tab they can see; auto_assign_tabs is where we guard against accidental
-    matches (e.g. a claude.ai/code IDE view being grabbed for a chat agent).
-    """
-    tabs = m.scan_tabs()
-    site = site_for_agent(agent_name)
-    if not site:
-        return None
-    for i, tab in enumerate(tabs):
-        if site["url_match"] in tab["url"]:
+            cls = classify_tab_url(tab["url"])
+            if wants_code:
+                if cls != "claude_code":
+                    continue
+            elif site["key"] == "claude_chat":
+                if cls != "claude_chat":
+                    continue
+            elif site["url_match"] not in tab["url"]:
+                continue
             try:
-                m.assign_tab(agent_name, i)
-                return tab["url"]
+                m.assign_tab(name, i, site_key_override)
+                used.add(i)
             except Exception:
+                pass
+            break
+
+def find_tab_for_agent(m: "BrowserManager", agent_name: str, cfg: Optional["AgentConfig"] = None) -> tuple[str | None, str]:
+    """Find an open tab matching this agent and assign it.
+
+    Returns (tab_url_or_None, message). Classification-aware: a chat persona
+    (no site_key override, or override == "claude_chat") only matches tabs
+    classified "claude_chat"; a claude_code persona (site_key == "claude_code")
+    only matches tabs classified "claude_code". Tabs already assigned to a
+    DIFFERENT agent are skipped with a specific reason rather than silently
+    stolen — one agent owns one tab is a hard rule, not a preference.
+    """
+    site_key_override = getattr(cfg, "site_key", "") if cfg else ""
+    site = site_for_agent(agent_name, site_key_override)
+    if not site:
+        return None, f"No site configured for '{agent_name}'."
+
+    wants_code = site["key"] == "claude_code"
+    is_chat_persona = site["key"] == "claude_chat"
+    tabs = m.scan_tabs()
+
+    rejected_path_seen  = False  # saw a claude.ai/code tab while looking for a chat persona
+    already_assigned_to = None
+    for i, tab in enumerate(tabs):
+        cls = classify_tab_url(tab["url"])
+        if wants_code:
+            if cls != "claude_code":
                 continue
-    return None
+        elif is_chat_persona:
+            if cls == "claude_code":
+                rejected_path_seen = True
+                continue
+            if cls != "claude_chat":
+                continue
+        else:
+            if site["url_match"] not in tab["url"]:
+                continue
+        marker = tab.get("marker", "")
+        if marker and marker != agent_name:
+            already_assigned_to = marker
+            continue
+        try:
+            m.assign_tab(agent_name, i, site_key_override)
+            return tab["url"], f"Assigned {agent_name.upper()} to tab: {tab['url'][:80]}"
+        except Exception:
+            continue
+
+    if already_assigned_to:
+        return None, f"Found Claude tab, but it is already assigned to {already_assigned_to.upper()}."
+    if wants_code:
+        return None, "No Claude Code tab found. Open claude.ai/code, or configure this agent as a normal Claude chat persona."
+    if rejected_path_seen:
+        return None, "Found claude.ai/code, but this agent is configured as a Claude chat persona, so the tab was rejected."
+    if site["key"] in ("claude_chat",):
+        return None, "No Claude chat tab found. Open a normal claude.ai chat tab, not claude.ai/code."
+    return None, f"No open {site['url_match']} tab found — open it in Chrome first, then click Find Tab."
 
 def disconnect_browser() -> None:
     m = st.session_state.pop("browser_manager", None)
@@ -462,6 +510,7 @@ def render_display(sid: str) -> None:
         debug_items       = []
         failures          = []
         envelope_warnings = []  # [(agent, warning_str), ...]
+        diagnostics       = []  # [diagnostics dict, ...] — speed/quality per agent per round
 
         for ev in revents:
             etype = ev["type"]
@@ -482,6 +531,9 @@ def render_display(sid: str) -> None:
                 # Collect any lineage warnings from the envelope
                 for w in env_e.get("warnings", []):
                     envelope_warnings.append((ev["agent"], w))
+                diag = env_e.get("diagnostics")
+                if diag:
+                    diagnostics.append(diag)
             elif etype == "synthesis":
                 with st.chat_message("synthesis", avatar="🔮"):
                     st.markdown(f"**SYNTHESIS**\n\n{ev['content']}")
@@ -491,7 +543,7 @@ def render_display(sid: str) -> None:
                 debug_items.append(ev)
 
         # Debug / Recovery panel — shown only when there is something to show
-        if failures or debug_items or envelope_warnings:
+        if failures or debug_items or envelope_warnings or diagnostics:
             label = f"🔍 Debug / Recovery — {len(failures)} failure(s)" if failures else "🔍 Debug"
             with st.expander(label, expanded=bool(failures)):
                 for ag, content, env_f in failures:
@@ -516,6 +568,23 @@ def render_display(sid: str) -> None:
                     for name, payload in ev.get("payloads", {}).items():
                         st.caption(name.upper())
                         st.code(payload, language=None)
+                if diagnostics:
+                    st.caption("⏱️ Speed diagnostics — where the time went, per agent:")
+                    rows = []
+                    for d in diagnostics:
+                        rows.append({
+                            "agent":        d.get("agent", "").upper(),
+                            "tab":          d.get("tab_classification") or "—",
+                            "prompt_chars": d.get("prompt_chars", 0),
+                            "construct_ms": d.get("construction_ms"),
+                            "insert_ms":    d.get("insertion_ms"),
+                            "send_ms":      d.get("send_verify_ms"),
+                            "wait_ms":      d.get("wait_response_ms"),
+                            "capture":      d.get("capture_method") or "—",
+                            "state":        d.get("reply_state") or "—",
+                            "fail_stage":   d.get("failure_stage") or "—",
+                        })
+                    st.table(rows)
 
 # ── Transcript export ─────────────────────────────────────────────────────────
 
@@ -890,6 +959,12 @@ def _build_browser_msg(sid: str, name: str, cfg, active: dict, user_msg: str) ->
         m.role == "assistant" and not _is_relay_failure(m.content) for m in history
     )
 
+    # Concise mode: opt-in toggle (Debug/control panel), off by default. Trims
+    # payload size without touching the existing cross-context truncation caps
+    # or transport/tab logic at all.
+    concise = st.session_state.get(f"ctrl_concise_{sid}", False)
+    concise_instr = "\n\n(Answer in 2–4 short paragraphs. Be direct.)" if concise else ""
+
     if is_first:
         # Use the enriched system prompt built at session creation (stored in the
         # session's system message) — NOT cfg.system_prompt, which is the raw yaml
@@ -900,11 +975,12 @@ def _build_browser_msg(sid: str, name: str, cfg, active: dict, user_msg: str) ->
         # whatever was previously in the window.
         return (
             "=== New relay session starting ===\n\n"
-            f"{sys_msg}\n\n---\n\n{user_msg}"
+            f"{sys_msg}\n\n---\n\n{user_msg}{concise_instr}"
         )
 
     cross = _build_cross_context(sid, name, active)
-    return f"{cross}\n\n---\n\nUser: {user_msg}" if cross else user_msg
+    msg = f"{cross}\n\n---\n\nUser: {user_msg}" if cross else user_msg
+    return msg + concise_instr
 
 
 def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = True,
@@ -948,8 +1024,13 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
     # is_first inside _build_browser_msg checks whether the agent has replied
     # before — that check is only valid on the pre-update history.
     payloads: dict = {}
+    construction_ms: dict = {}
     for name, cfg in browser_agents.items():
+        _t0 = time.time()
         payloads[name] = _build_browser_msg(sid, name, cfg, active, user_msg)
+        construction_ms[name] = int((time.time() - _t0) * 1000)
+        _log.info(f"[sid={sid}, round={round_id}, agent={name}] "
+                 f"prompt_chars={len(payloads[name])}")
 
     # Diagnostic dump: capture the EXACT string about to be typed into each
     # tab, before send_batch touches the (possibly still-flaky) browser
@@ -1068,6 +1149,46 @@ def run_round(sid: str, participants: dict, user_msg: str, synthesize: bool = Tr
                 transport_stats["semantic_unconfirmed"] += 1
             else:
                 transport_stats["confirmed"] += 1
+
+            # Speed/quality diagnostics for this agent this round -- rides through
+            # display.jsonl automatically via the existing env_meta mechanism.
+            if original_is_failure:
+                reply_state = "transport_failure"
+            elif quarantined:
+                reply_state = "quarantined"
+            elif raw.get("capture_method") == "semantic_unconfirmed":
+                reply_state = "semantic_unconfirmed"
+            else:
+                reply_state = "confirmed"
+
+            if quarantined:
+                failure_stage  = raw.get("failure_stage") or "validation"
+                failure_reason = discard_reason
+            elif original_is_failure:
+                failure_stage  = raw.get("failure_stage") or "transport"
+                failure_reason = payload
+            else:
+                failure_stage  = None
+                failure_reason = None
+
+            timing = raw.get("timing") or {}
+            if isinstance(raw, dict):
+                raw["diagnostics"] = {
+                    "round_id":           round_id,
+                    "agent":              name,
+                    "prompt_chars":       len(payloads.get(name, "") or ""),
+                    "files_included":     [],
+                    "tab_classification": raw.get("site_key") or None,
+                    "construction_ms":    construction_ms.get(name),
+                    "insertion_ms":       timing.get("insertion_ms"),
+                    "send_verify_ms":     timing.get("send_verify_ms"),
+                    "wait_response_ms":   timing.get("wait_response_ms"),
+                    "capture_ms":         None,
+                    "capture_method":     raw.get("capture_method"),
+                    "reply_state":        reply_state,
+                    "failure_stage":      failure_stage,
+                    "failure_reason":     failure_reason,
+                }
 
             raw_envs[name] = raw
             replies[name]  = payload
@@ -1469,6 +1590,7 @@ if mode == "Conversations":
             _k_agents  = f"ctrl_agents_{sid}"
             _k_rounds  = f"ctrl_rounds_{sid}"
             _k_synth   = f"ctrl_synth_{sid}"
+            _k_concise = f"ctrl_concise_{sid}"
             # Seed defaults only on first render for this session
             if _k_agents not in st.session_state:
                 st.session_state[_k_agents] = list(participants.keys())
@@ -1501,7 +1623,7 @@ if mode == "Conversations":
                 with cp3:
                     st.metric("Round", meta.get("round_count", 0))
 
-                ctrl1, ctrl2, ctrl3, ctrl4, ctrl5, ctrl6 = st.columns(6)
+                ctrl1, ctrl2, ctrl3, ctrl4, ctrl5, ctrl6, ctrl7 = st.columns(7)
                 with ctrl1:
                     synthesize = st.toggle("🔮 Synthesize", value=True, key=_k_synth)
                 with ctrl2:
@@ -1524,6 +1646,12 @@ if mode == "Conversations":
                     preflight_btn = st.button("🛫 Preflight", use_container_width=True,
                                               help="Check tab identity, URL, input visibility, and semantic "
                                                    "count for every selected agent — no prompt sent.")
+                with ctrl7:
+                    concise = st.toggle("✂️ Concise", value=False, key=_k_concise,
+                                        help="Instruct agents to answer in 2–4 short paragraphs and use "
+                                             "only the latest reply from each other agent (not the full "
+                                             "transcript) as cross-context — shrinks prompt size, doesn't "
+                                             "change tab/transport behavior.")
 
                 _loop = _get_auto_loop(sid)
                 if _loop is None:
@@ -1793,6 +1921,35 @@ elif mode == "Agents":
                     else:
                         st.error(err)
 
+            if mgr:
+                with st.expander("🔍 Scanned tabs (debug)"):
+                    try:
+                        scanned = mgr.scan_tabs()
+                    except Exception as e:
+                        scanned = []
+                        st.caption(f"scan_tabs() failed: {e}")
+                    rows = []
+                    for i, tab in enumerate(scanned):
+                        marker = tab.get("marker", "")
+                        cls    = tab.get("classification", classify_tab_url(tab["url"]))
+                        if marker:
+                            reason = f"assigned to {marker}"
+                        elif cls == "unsupported":
+                            reason = "no known site matches this URL"
+                        elif cls == "claude_other":
+                            reason = "claude.ai but not chat composer or /code"
+                        else:
+                            reason = "available"
+                        rows.append({
+                            "index": i, "title": tab.get("title", "")[:40],
+                            "url": tab["url"][:70], "classification": cls,
+                            "assigned_to": marker or "—", "reason": reason,
+                        })
+                    if rows:
+                        st.table(rows)
+                    else:
+                        st.caption("No tabs visible.")
+
         st.divider()
         if not agents_cfg:
             st.info("No agents yet — click **＋ New Agent** in the sidebar.")
@@ -1807,7 +1964,7 @@ elif mode == "Agents":
                 c1, c2, c3, c4 = st.columns([5, 2, 1, 1])
                 with c1:
                     if is_browser:
-                        site   = site_for_agent(name)
+                        site   = site_for_agent(name, getattr(cfg, "site_key", ""))
                         label  = site["key"] if site else "browser"
                         status = "✓" if has_tab else "○"
                         st.markdown(f"**{avatar(name)} {name.upper()}** &nbsp; {status} {label}")
@@ -1879,31 +2036,35 @@ elif mode == "Agents":
                                     _set_agent_statuses({name: "Failed"})
                                 st.rerun()
                         else:
-                            site = site_for_agent(name)
-                            is_claude = site and site.get("key") == "claude"
+                            site_key_override = getattr(cfg, "site_key", "")
+                            site = site_for_agent(name, site_key_override)
+                            is_claude = site and site.get("key") in ("claude_chat", "claude_code")
                             bc1, bc2 = st.columns(2)
                             with bc1:
                                 if st.button("Find Tab", key=f"ft_{name}", use_container_width=True,
                                              type="primary" if is_claude else "secondary"):
-                                    found = find_tab_for_agent(mgr, name)
+                                    found, msg = find_tab_for_agent(mgr, name, cfg)
                                     if found:
+                                        st.session_state.pop(f"tab_err_{name}", None)
                                         st.rerun()
                                     else:
-                                        site_key = (site_for_agent(name) or {}).get("url_match", "the site")
-                                        st.session_state[f"tab_err_{name}"] = f"No open {site_key} tab found — open it in Chrome first, then click Find Tab"
+                                        st.session_state[f"tab_err_{name}"] = msg
                                         st.rerun()
                             with bc2:
                                 if st.button("Open Tab", key=f"ot_{name}", use_container_width=True):
                                     with st.spinner(f"Opening {name.upper()}…"):
                                         try:
-                                            mgr.open_tab(name); st.rerun()
+                                            mgr.open_tab(name, site_key_override); st.rerun()
                                         except Exception as e:
                                             st.session_state[f"tab_err_{name}"] = str(e); st.rerun()
                             err = st.session_state.pop(f"tab_err_{name}", None)
                             if err:
                                 st.error(err)
                             if is_claude and not has_tab:
-                                st.caption("💡 Open claude.ai in Chrome, sign in, then **Find Tab**")
+                                if site["key"] == "claude_code":
+                                    st.caption("💡 Open claude.ai/code in Chrome, then **Find Tab**")
+                                else:
+                                    st.caption("💡 Open claude.ai in Chrome, sign in, then **Find Tab**")
                     elif is_browser and not mgr:
                         st.caption("Connect Chrome first")
 
@@ -1928,8 +2089,16 @@ elif mode == "Agents":
         else:
             new_provider = "browser"
             new_model    = ""
-            if PLAYWRIGHT_AVAILABLE and site_for_agent(new_name.strip()):
-                st.caption(f"Will open: {site_for_agent(new_name.strip())['url']}")
+            new_site_key = st.selectbox(
+                "Browser site", ["(auto from name)", "claude_chat", "claude_code"],
+                help='"claude_code" only matters for the literal claude.ai/code IDE view — '
+                     "leave on auto for normal chat personas, even ones named "
+                     '"claude_code_architect"/etc.',
+            )
+            new_site_key = "" if new_site_key == "(auto from name)" else new_site_key
+            resolved = site_for_agent(new_name.strip(), new_site_key) if PLAYWRIGHT_AVAILABLE else None
+            if resolved:
+                st.caption(f"Will open: {resolved['url']}")
 
         new_prompt = st.text_area("System Prompt", height=200,
                                   placeholder="Describe this agent's personality and approach.")
@@ -1941,7 +2110,8 @@ elif mode == "Agents":
                 elif slug in agents_cfg: st.warning(f"'{slug}' already exists.")
                 else:
                     agents_cfg[slug] = AgentConfig(slug, new_provider, new_model,
-                                                   new_prompt.strip(), new_mode)
+                                                   new_prompt.strip(), new_mode,
+                                                   site_key=new_site_key if new_mode == "browser" else "")
                     save_agents(agents_cfg)
                     st.session_state.edit_agent = None; st.rerun()
         with c2:
@@ -1966,13 +2136,23 @@ elif mode == "Agents":
         else:
             upd_provider = "browser"
             upd_model    = ""
+            _site_opts   = ["(auto from name)", "claude_chat", "claude_code"]
+            _cur_site_key = getattr(cfg, "site_key", "") or "(auto from name)"
+            upd_site_key = st.selectbox(
+                "Browser site", _site_opts,
+                index=_site_opts.index(_cur_site_key) if _cur_site_key in _site_opts else 0,
+                help='Set to "claude_code" only for an agent dedicated to driving the '
+                     "literal claude.ai/code IDE view.",
+            )
+            upd_site_key = "" if upd_site_key == "(auto from name)" else upd_site_key
 
         upd_prompt = st.text_area("System Prompt", value=cfg.system_prompt, height=260)
         c1, c2 = st.columns(2)
         with c1:
             if st.button("Save", type="primary", use_container_width=True):
                 agents_cfg[ea] = AgentConfig(ea, upd_provider, upd_model,
-                                             upd_prompt.strip(), upd_mode)
+                                             upd_prompt.strip(), upd_mode,
+                                             site_key=upd_site_key if upd_mode == "browser" else "")
                 save_agents(agents_cfg)
                 st.session_state.edit_agent = None; st.rerun()
         with c2:

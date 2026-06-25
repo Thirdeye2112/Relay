@@ -126,10 +126,13 @@ except AssertionError as e:
 # ── 5. site_for_agent matching ────────────────────────────────────────────────
 print("\n--- site_for_agent ---")
 cases = [
-    ("claude_optimist",      "claude"),
-    ("claude_skeptic",       "claude"),
-    ("claude_code_architect","claude"),
-    ("claude_code_pragmatist","claude"),
+    # "claude"-containing names always infer claude_chat, never claude_code --
+    # claude_code is only reachable via an explicit site_key override, even
+    # for chat personas with code-flavored names like these two.
+    ("claude_optimist",      "claude_chat"),
+    ("claude_skeptic",       "claude_chat"),
+    ("claude_code_architect","claude_chat"),
+    ("claude_code_pragmatist","claude_chat"),
     ("chatgpt",              "chatgpt"),
     ("gemini",               "gemini"),
     ("perplexity",           "perplexity"),
@@ -148,6 +151,30 @@ if br.site_for_agent("random_unknown_xyz") is None:
     ok("unknown agent -> None")
 else:
     fail("unknown agent", "should return None")
+
+# An explicit override always wins, regardless of name inference.
+site = br.site_for_agent("claude_optimist", "claude_code")
+if site and site["key"] == "claude_code":
+    ok("explicit site_key override -> claude_code")
+else:
+    fail("explicit site_key override", f"got {site['key'] if site else None!r}")
+
+# ── 5b. classify_tab_url ───────────────────────────────────────────────────────
+print("\n--- classify_tab_url ---")
+url_cases = [
+    ("https://claude.ai/code",          "claude_code"),
+    ("https://claude.ai/chat/abc123",   "claude_chat"),
+    ("https://claude.ai/new",           "claude_chat"),
+    ("https://claude.ai/settings/profile", "claude_other"),
+    ("https://chatgpt.com/c/abc",       "chatgpt"),
+    ("https://example.com/whatever",    "unsupported"),
+]
+for url, expected in url_cases:
+    got = br.classify_tab_url(url)
+    if got == expected:
+        ok(f"{url!r} -> {expected}")
+    else:
+        fail(f"{url!r} -> {expected}", f"got {got!r}")
 
 # ── 6. _clean_diff ────────────────────────────────────────────────────────────
 print("\n--- _clean_diff ---")

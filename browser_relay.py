@@ -26,7 +26,14 @@ except Exception:
 CDP_URL = "http://localhost:9222"
 
 SITES: dict[str, dict] = {
-    "claude": {
+    # "claude_chat" is the normal claude.ai chat composer. It must NEVER match
+    # claude.ai/code (the separate Claude Code IDE web view) -- that page has
+    # none of the selectors below, so a tab assigned there would silently fail
+    # every send with "Input box not found". url_match is deliberately just
+    # "claude.ai" (not narrower) because exclusion of /code lives in
+    # classify_tab_url()/find_tab_for_agent, which run BEFORE url_match is used
+    # to decide whether a scanned tab is even offered to a chat persona.
+    "claude_chat": {
         "url":          "https://claude.ai/new",
         "url_match":    "claude.ai",
         "input":        [
@@ -62,6 +69,29 @@ SITES: dict[str, dict] = {
             '[class*="claude-message"] .prose',
             '[data-is-streaming="false"] .prose',
         ],
+    },
+    # "claude_code" is claude.ai/code -- the Claude Code IDE web view, a
+    # completely different product surface than the chat composer above.
+    # Its DOM has not been verified against a live tab (no confirmed composer/
+    # send/response selectors exist yet); this entry exists so an explicit
+    # site_key override can select it and so fast/full health checks can
+    # report "unsupported" with a clear reason instead of a generic failure.
+    # Only reachable via an explicit site_key override -- never inferred from
+    # an agent name (agents like claude_code_architect are chat personas
+    # despite the name, and must keep matching claude_chat).
+    "claude_code": {
+        "url":            "https://claude.ai/code",
+        "url_match":      "claude.ai/code",
+        "experimental":   True,  # selectors below are best-effort guesses, unverified
+        "input":          [
+            '[data-testid="chat-input"] div[contenteditable="true"]',
+            'div[contenteditable="true"]',
+            "textarea",
+        ],
+        "stop_btn":     '[aria-label="Stop"]',
+        "send_btn":     '[data-testid="send-button"]',
+        "semantic_sel": ['[data-testid="assistant-message"]'],
+        "response_sel": ['[data-testid="assistant-message"]'],
     },
     "chatgpt": {
         "url":          "https://chatgpt.com/",
@@ -181,12 +211,54 @@ SITES: dict[str, dict] = {
 }
 
 
-def site_for_agent(agent_name: str) -> Optional[dict]:
+def site_for_agent(agent_name: str, site_key_override: str = "") -> Optional[dict]:
+    """Resolve an agent to a SITES entry.
+
+    site_key_override, when set, wins outright -- this is the only way an
+    agent can ever resolve to "claude_code". Without an override, matching is
+    by substring on a normalized agent name, with one deliberate special case:
+    "claude" (in any form -- claude_optimist, claude_code_architect, etc.)
+    always maps to "claude_chat", never to "claude_code". This keeps existing
+    personas whose names happen to contain "code" (claude_code_architect,
+    claude_code_pragmatist -- chat personas with a systems-design personality,
+    not drivers of the literal Claude Code product) from ever being silently
+    routed to claude.ai/code.
+    """
+    if site_key_override:
+        cfg = SITES.get(site_key_override)
+        return {"key": site_key_override, **cfg} if cfg else None
     key = agent_name.lower().replace("_", "").replace(" ", "").replace("-", "")
+    if "claude" in key:
+        return {"key": "claude_chat", **SITES["claude_chat"]}
     for site_key, cfg in SITES.items():
+        if site_key in ("claude_chat", "claude_code"):
+            continue
         if site_key in key:
             return {"key": site_key, **cfg}
     return None
+
+
+def classify_tab_url(url: str) -> str:
+    """Classify a scanned browser tab's URL for tab-discovery/debug display.
+
+    Returns one of: claude_chat, claude_code, claude_other, chatgpt, gemini,
+    perplexity, grok, copilot, unsupported. claude_other catches claude.ai
+    pages that are neither the chat composer nor /code (e.g. /settings) --
+    a real Claude tab, just not one Relay can drive.
+    """
+    _NON_CHAT_CLAUDE_PATHS = ("/settings", "/account", "/projects", "/team")
+    if "claude.ai/code" in url:
+        return "claude_code"
+    if "claude.ai" in url:
+        if any(p in url for p in _NON_CHAT_CLAUDE_PATHS):
+            return "claude_other"
+        return "claude_chat"
+    for site_key, cfg in SITES.items():
+        if site_key in ("claude_chat", "claude_code"):
+            continue
+        if cfg["url_match"] in url:
+            return site_key
+    return "unsupported"
 
 
 # ── Page helpers ────────────────────────────────────────────────────────────────
@@ -450,7 +522,12 @@ def _verify_prompt_inserted(el, message: str) -> tuple[bool, str]:
 
 
 def _type_and_submit(page, site: dict, message: str, agent: str = "",
-                      fast_mode: bool = False) -> None:
+                      fast_mode: bool = False) -> dict:
+    """Returns {"insertion_ms": int, "send_verify_ms": int} on success.
+    Still raises RuntimeError on failure (callers unchanged) -- timing is
+    additive, not a new control-flow path.
+    """
+    _t0 = time.time()
     """fast_mode tightens the submit-tier verification deadlines below for
     the batch-send context specifically: _do_send_batch's Step 1 submits to
     every agent SEQUENTIALLY on this one thread (deliberately -- Playwright's
@@ -525,6 +602,7 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "",
             f"the intended message (composer has: {actual_text[:120]!r})"
         )
 
+    _t_insert_done = time.time()
     pre_counts = _response_counts(page, site)
     pre_url    = page.url  # capture URL for navigation-detection in _verify_sent
     submitted  = False
@@ -627,6 +705,12 @@ def _type_and_submit(page, site: dict, message: str, agent: str = "",
             "Message pasted but send did not trigger — composer never cleared "
             "and no new response/stop indicator appeared after all submit attempts."
         )
+
+    _t_end = time.time()
+    return {
+        "insertion_ms":   int((_t_insert_done - _t0) * 1000),
+        "send_verify_ms": int((_t_end - _t_insert_done) * 1000),
+    }
 
 
 def _page_text(page) -> str:
@@ -848,7 +932,7 @@ def _clean_diff(text: str) -> str:
 def _make_envelope(agent: str, payload: str, pre_counts: dict,
                    page, site, pre_method: str = "fallback",
                    pre_url: str = "", grace_retries: int = 3,
-                   grace_interval: float = 0.25) -> dict:
+                   grace_interval: float = 0.25, timing: dict | None = None) -> dict:
     """Wrap a scraped response in a lineage envelope.
 
     Captures pre/post DOM element counts so app.py can reject stale reads
@@ -947,10 +1031,13 @@ def _make_envelope(agent: str, payload: str, pre_counts: dict,
         "warnings":           warnings,
         "timestamp":          time.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "payload":            payload,
+        "site_key":           (site or {}).get("key", ""),
+        "timing":             timing or {},
     }
 
 
-def _error_envelope(agent: str, message: str) -> dict:
+def _error_envelope(agent: str, message: str, timing: dict | None = None,
+                    failure_stage: str = "", site_key: str = "") -> dict:
     """Build an envelope for a setup/transport error (no DOM counts available)."""
     return {
         "event_id":           str(_uuid.uuid4()),
@@ -963,6 +1050,9 @@ def _error_envelope(agent: str, message: str) -> dict:
         "warnings":           [],
         "timestamp":          time.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "payload":            message,
+        "site_key":           site_key,
+        "timing":             timing or {},
+        "failure_stage":      failure_stage,
     }
 
 
@@ -994,6 +1084,7 @@ class BrowserManager:
         self._cmd_q   = queue.Queue()
         self._ready_q = queue.Queue()
         self._pages: dict[str, object] = {}  # agent_name -> page
+        self._site_overrides: dict[str, str] = {}  # agent_name -> explicit site_key (e.g. "claude_code")
         self._cdp_sessions: list = []        # keep refs alive so listeners aren't GC'd
         self._browser = None
         self._stopped = False  # set True by close() so alive goes False immediately
@@ -1042,7 +1133,7 @@ class BrowserManager:
                     try:
                         if   action == "scan":         self._do_scan(res_q)
                         elif action == "assign":       self._do_assign(agent, payload, res_q)
-                        elif action == "open_tab":     self._do_open_tab(agent, res_q)
+                        elif action == "open_tab":     self._do_open_tab(agent, payload, res_q)
                         elif action == "send":         self._do_send(agent, payload, res_q)
                         elif action == "send_batch":   self._do_send_batch(payload, res_q)
                         elif action == "fast_health":  self._do_fast_health(agent, res_q)
@@ -1077,6 +1168,10 @@ class BrowserManager:
             except Exception:
                 pass
 
+    def _resolve_site(self, agent: str) -> Optional[dict]:
+        """site_for_agent, but honoring any explicit override set via assign_tab/open_tab."""
+        return site_for_agent(agent, self._site_overrides.get(agent, ""))
+
     def _heartbeat(self):
         dead = [n for n, p in self._pages.items() if p.is_closed()]
         for n in dead:
@@ -1101,12 +1196,21 @@ class BrowserManager:
             except Exception:
                 title = ""        # title is display-only; don't stall the whole scan
             marker = _read_page_agent_marker(p)
-            tabs.append({"url": url, "title": title, "marker": marker})
+            tabs.append({
+                "url": url, "title": title, "marker": marker,
+                "classification": classify_tab_url(url),
+            })
         res_q.put(("ok", tabs))
 
-    def _do_assign(self, agent: str, page_index: int, res_q):
+    def _do_assign(self, agent: str, payload, res_q):
+        if isinstance(payload, tuple):
+            page_index, site_key = payload
+        else:
+            page_index, site_key = payload, ""
         pages = self._all_pages()
         if 0 <= page_index < len(pages):
+            if site_key:
+                self._site_overrides[agent] = site_key
             self._pages[agent] = pages[page_index]
             _mark_page_for_agent(pages[page_index], agent)
             res_q.put(("ok", None))
@@ -1123,8 +1227,10 @@ class BrowserManager:
         except Exception:
             pass
 
-    def _do_open_tab(self, agent: str, res_q):
-        site = site_for_agent(agent)
+    def _do_open_tab(self, agent: str, site_key: str, res_q):
+        if site_key:
+            self._site_overrides[agent] = site_key
+        site = self._resolve_site(agent)
         if not site:
             res_q.put(("error", f"No site configured for '{agent}'"))
             return
@@ -1153,7 +1259,7 @@ class BrowserManager:
         full diagnostic picture even for an agent that's already failing.
         """
         page = self._pages.get(agent)
-        site = site_for_agent(agent)
+        site = self._resolve_site(agent)
         result: dict = {"agent": agent, "ok": False, "reason": None,
                         "marker": "", "marker_ok": None, "semantic_count": None}
 
@@ -1186,7 +1292,10 @@ class BrowserManager:
         try:
             el = _resolve_selector(page, site.get("input", []), timeout=2000, prefer_latest=False)
             if el is None:
-                result["reason"] = "Input box not visible or not found"
+                if site.get("experimental"):
+                    result["reason"] = "unsupported — claude.ai/code has no known composer/send/response selectors yet"
+                else:
+                    result["reason"] = "Input box not visible or not found"
                 res_q.put(("ok", result))
                 return
         except Exception as exc:
@@ -1207,7 +1316,7 @@ class BrowserManager:
         """Send a tiny probe message and verify the response — slow path."""
         _PROBE = "Reply with exactly these two words and nothing else: health-ok"
         page = self._pages.get(agent)
-        site = site_for_agent(agent)
+        site = self._resolve_site(agent)
         result: dict = {"agent": agent, "ok": False, "reason": None, "response": None}
 
         if page is None or page.is_closed() or site is None:
@@ -1245,7 +1354,7 @@ class BrowserManager:
         if page is None or page.is_closed():
             res_q.put(("error", f"No tab assigned to '{agent}' — assign one in Agents."))
             return
-        site = site_for_agent(agent)
+        site = self._resolve_site(agent)
         if site is None:
             res_q.put(("error", f"Unknown site for agent '{agent}'"))
             return
@@ -1259,8 +1368,11 @@ class BrowserManager:
         pre_counts = _semantic_counts(page, site)  # element counts before typing
         pre_method = "semantic" if site.get("semantic_sel") else "fallback"
         pre_url = page.url
-        _type_and_submit(page, site, msg, agent)
+        submit_timing = _type_and_submit(page, site, msg, agent)
+        _t_wait_start = time.time()
         envelope = _wait_and_read(page, site, timeout, pre_len, pre_counts, agent, pre_method, pre_url)
+        envelope["timing"] = {**submit_timing, "wait_response_ms": int((time.time() - _t_wait_start) * 1000)}
+        envelope["site_key"] = site.get("key", "")
         res_q.put(("ok", envelope))
 
     def _do_send_batch(self, payloads: dict, res_q):
@@ -1276,14 +1388,15 @@ class BrowserManager:
         state = {}
         for ag, (msg, tout) in payloads.items():
             page = self._pages.get(ag)
-            site = site_for_agent(ag)
+            site = self._resolve_site(ag)
             if page is None or page.is_closed() or site is None:
-                state[ag] = {"error": "No tab assigned or unknown site"}
+                state[ag] = {"error": "No tab assigned or unknown site", "failure_stage": "assignment"}
                 _save_debug(page, ag, "batch_02_no_tab") if page else None
                 continue
             id_ok, id_marker = _verify_tab_identity(page, ag)
             if not id_ok:
-                state[ag] = {"error": f"TAB_IDENTITY_MISMATCH — expected '{ag}', got '{id_marker}'"}
+                state[ag] = {"error": f"TAB_IDENTITY_MISMATCH — expected '{ag}', got '{id_marker}'",
+                             "failure_stage": "assignment"}
                 _save_debug(page, ag, "batch_01_identity_mismatch")
                 _log.warning(f"[agent={ag}] Tab identity mismatch — expected '{ag}', tab marked '{id_marker}'")
                 continue
@@ -1300,7 +1413,7 @@ class BrowserManager:
                 pre_url    = page.url  # capture BEFORE submit for URL-change detection
                 pre_counts = _semantic_counts(page, site)
                 pre_method = "semantic" if site.get("semantic_sel") else "fallback"
-                _type_and_submit(page, site, msg, ag, fast_mode=True)
+                submit_timing = _type_and_submit(page, site, msg, ag, fast_mode=True)
                 # For sites that navigate on submit (e.g. Perplexity home → search
                 # result), the pre_len measured on the old page is useless for the
                 # text-diff fallback.  Re-capture from the NEW page if the URL changed.
@@ -1320,6 +1433,7 @@ class BrowserManager:
                     "pre_method": pre_method,
                     "pre_url":  pre_url,  # URL before submit
                     "prev_len": pre_len,
+                    "submit_timing": submit_timing,
                     "start": time.time(),
                     "deadline": time.time() + tout,
                     "stable": 0, "stop_seen": False, "new_el_seen": False,
@@ -1327,11 +1441,13 @@ class BrowserManager:
                 }
             except Exception as e:
                 _log.error(f"[agent={ag}] Batch type/submit error — {e}", exc_info=True)
-                state[ag] = {"error": str(e)}
+                state[ag] = {"error": str(e), "failure_stage": "insertion"}
                 _save_debug(page, ag, "batch_02_type_error")
 
         results = {
-            a: _error_envelope(a, f"[Error: {s['error']}]")
+            a: _error_envelope(a, f"[Error: {s['error']}]",
+                               failure_stage=s.get("failure_stage", ""),
+                               site_key=(s.get("site") or {}).get("key", ""))
             for a, s in state.items() if "error" in s
         }
         pending  = [a for a in state if "error" not in state[a]]
@@ -1355,7 +1471,9 @@ class BrowserManager:
                     results[ag] = _make_envelope(ag, resp or "[Timed out]",
                                                  s["pre_counts"], page, site,
                                                  s.get("pre_method", "fallback"),
-                                                 s.get("pre_url", ""))
+                                                 s.get("pre_url", ""),
+                                                 timing={**s.get("submit_timing", {}),
+                                                         "wait_response_ms": int((time.time() - s["start"]) * 1000)})
                     _save_debug(page, ag, "batch_05_timeout")
                     continue
 
@@ -1386,7 +1504,9 @@ class BrowserManager:
                         results[ag] = _make_envelope(ag, resp or "[No response captured]",
                                                      s["pre_counts"], page, site,
                                                      s.get("pre_method", "fallback"),
-                                                     s.get("pre_url", ""))
+                                                     s.get("pre_url", ""),
+                                                     timing={**s.get("submit_timing", {}),
+                                                             "wait_response_ms": int((time.time() - s["start"]) * 1000)})
                         continue
 
                 # ── Element-count gate — also opens on URL change.
@@ -1434,7 +1554,9 @@ class BrowserManager:
                         results[ag] = _make_envelope(ag, resp or "[No response captured]",
                                                      s["pre_counts"], page, site,
                                                      s.get("pre_method", "fallback"),
-                                                     s.get("pre_url", ""))
+                                                     s.get("pre_url", ""),
+                                                     timing={**s.get("submit_timing", {}),
+                                                             "wait_response_ms": int((time.time() - s["start"]) * 1000)})
                         continue
                 else:
                     s["stable"] = 0
@@ -1463,12 +1585,17 @@ class BrowserManager:
         except Exception:
             return []
 
-    def assign_tab(self, agent: str, tab_index: int) -> None:
-        self._call("assign", agent, tab_index, timeout=5)
+    def assign_tab(self, agent: str, tab_index: int, site_key: str = "") -> None:
+        """site_key, when given, is recorded as an explicit override (e.g.
+        "claude_code") so this agent's subsequent sends resolve to that site
+        even though its name would otherwise infer "claude_chat"."""
+        payload = (tab_index, site_key) if site_key else tab_index
+        self._call("assign", agent, payload, timeout=5)
 
-    def open_tab(self, agent: str) -> None:
-        """Open a new tab in Chrome and navigate to the agent's site."""
-        self._call("open_tab", agent, timeout=35)
+    def open_tab(self, agent: str, site_key: str = "") -> None:
+        """Open a new tab in Chrome and navigate to the agent's site.
+        site_key overrides the inferred site the same way assign_tab does."""
+        self._call("open_tab", agent, site_key, timeout=35)
 
     def send_message(self, agent: str, message: str, timeout: int = 120) -> dict:
         """Returns a lineage envelope (dict with a "payload" key), not a bare
